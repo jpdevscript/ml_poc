@@ -1,0 +1,387 @@
+"""
+PD Measurement Service - Backend logic for face detection and PD calculation.
+Uses Roboflow ROI + SAM3 segmentation for calibration.
+Includes head pose detection to ensure user is looking straight.
+"""
+
+import os
+import cv2
+import numpy as np
+from typing import Optional, Tuple, Dict, Any
+from datetime import datetime
+import math
+
+from pd_engine.core import PDMeasurement
+
+
+class FaceDetector:
+    """Face detection with head pose estimation using MediaPipe."""
+    
+    def __init__(self):
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        
+        # Initialize MediaPipe Face Mesh for head pose
+        try:
+            import mediapipe as mp
+            self.mp_face_mesh = mp.solutions.face_mesh
+            self.face_mesh = self.mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=1,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+            self.use_mediapipe = True
+            print("[FaceDetector] MediaPipe Face Mesh initialized for head pose")
+        except Exception as e:
+            print(f"[FaceDetector] MediaPipe not available: {e}")
+            self.use_mediapipe = False
+            self.face_mesh = None
+    
+    def _check_blur(self, image: np.ndarray, face_rect: Optional[Tuple[int, int, int, int]] = None) -> Tuple[bool, float]:
+        """
+        Check if image is blurry using Laplacian variance.
+        
+        Args:
+            image: BGR input image
+            face_rect: Optional (x, y, w, h) to check only face region
+            
+        Returns:
+            (is_sharp, blur_score) - True if sharp enough, and the blur score
+        """
+        BLUR_THRESHOLD = 50.0  # Lower = more blurry
+        
+        if face_rect is not None:
+            x, y, w, h = face_rect
+            roi = image[y:y+h, x:x+w]
+        else:
+            roi = image
+        
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        
+        is_sharp = laplacian_var > BLUR_THRESHOLD
+        return is_sharp, laplacian_var
+    
+    def _estimate_head_pose(self, image: np.ndarray) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """
+        Estimate head pose (yaw, pitch, roll) using MediaPipe face landmarks.
+        Returns (yaw, pitch, roll) in degrees, or (None, None, None) if detection fails.
+        """
+        if not self.use_mediapipe or self.face_mesh is None:
+            return None, None, None
+        
+        try:
+            h, w = image.shape[:2]
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            results = self.face_mesh.process(rgb_image)
+            
+            if not results.multi_face_landmarks:
+                return None, None, None
+            
+            landmarks = results.multi_face_landmarks[0]
+            
+            # Key landmarks for pose estimation
+            # Nose tip (1), Chin (152), Left eye outer (33), Right eye outer (263), 
+            # Left mouth corner (61), Right mouth corner (291)
+            nose_tip = landmarks.landmark[1]
+            chin = landmarks.landmark[152]
+            left_eye = landmarks.landmark[33]
+            right_eye = landmarks.landmark[263]
+            left_mouth = landmarks.landmark[61]
+            right_mouth = landmarks.landmark[291]
+            
+            # 3D model points (normalized face)
+            model_points = np.array([
+                (0.0, 0.0, 0.0),             # Nose tip
+                (0.0, -63.6, -12.5),         # Chin
+                (-43.3, 32.7, -26.0),        # Left eye
+                (43.3, 32.7, -26.0),         # Right eye
+                (-28.9, -28.9, -24.1),       # Left mouth
+                (28.9, -28.9, -24.1)         # Right mouth
+            ], dtype=np.float64)
+            
+            # 2D image points
+            image_points = np.array([
+                (nose_tip.x * w, nose_tip.y * h),
+                (chin.x * w, chin.y * h),
+                (left_eye.x * w, left_eye.y * h),
+                (right_eye.x * w, right_eye.y * h),
+                (left_mouth.x * w, left_mouth.y * h),
+                (right_mouth.x * w, right_mouth.y * h)
+            ], dtype=np.float64)
+            
+            # Camera matrix (approximate)
+            focal_length = w
+            center = (w / 2, h / 2)
+            camera_matrix = np.array([
+                [focal_length, 0, center[0]],
+                [0, focal_length, center[1]],
+                [0, 0, 1]
+            ], dtype=np.float64)
+            
+            dist_coeffs = np.zeros((4, 1))
+            
+            # Solve PnP
+            success, rotation_vec, translation_vec = cv2.solvePnP(
+                model_points, image_points, camera_matrix, dist_coeffs
+            )
+            
+            if not success:
+                return None, None, None
+            
+            # Convert to rotation matrix and then to Euler angles
+            rotation_mat, _ = cv2.Rodrigues(rotation_vec)
+            
+            # Extract Euler angles
+            sy = math.sqrt(rotation_mat[0, 0] ** 2 + rotation_mat[1, 0] ** 2)
+            singular = sy < 1e-6
+            
+            if not singular:
+                pitch = math.atan2(rotation_mat[2, 1], rotation_mat[2, 2])
+                yaw = math.atan2(-rotation_mat[2, 0], sy)
+                roll = math.atan2(rotation_mat[1, 0], rotation_mat[0, 0])
+            else:
+                pitch = math.atan2(-rotation_mat[1, 2], rotation_mat[1, 1])
+                yaw = math.atan2(-rotation_mat[2, 0], sy)
+                roll = 0
+            
+            # Convert to degrees
+            pitch = math.degrees(pitch)
+            yaw = math.degrees(yaw)
+            roll = math.degrees(roll)
+            
+            return yaw, pitch, roll
+            
+        except Exception as e:
+            print(f"[FaceDetector] Head pose error: {e}")
+            return None, None, None
+    
+    def detect(self, image: np.ndarray) -> Dict[str, Any]:
+        """
+        Detect face and return guidance including head pose.
+        """
+        h, w = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Detect face using Haar cascade
+        faces = self.face_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+        )
+        
+        if len(faces) == 0:
+            return {
+                'detected': False,
+                'face_rect': None,
+                'center_x': None,
+                'center_y': None,
+                'face_size': None,
+                'head_pose': None,
+                'guidance': {'horizontal': 'none', 'vertical': 'none', 'distance': 'none', 'look': 'none'},
+                'is_positioned': False
+            }
+        
+        # Get largest face
+        face = max(faces, key=lambda f: f[2] * f[3])
+        x, y, fw, fh = face
+        
+        # Normalize positions
+        center_x = (x + fw / 2) / w
+        center_y = (y + fh / 2) / h
+        face_size = fw / w
+        
+        # Get head pose
+        yaw, pitch, roll = self._estimate_head_pose(image)
+        head_pose = {'yaw': yaw, 'pitch': pitch, 'roll': roll} if yaw is not None else None
+        
+        # Target: face centered (stricter tolerances)
+        TARGET_X = 0.5
+        TARGET_Y = 0.45
+        TOLERANCE_X = 0.08  # Stricter - must be well centered
+        TOLERANCE_Y = 0.08  # Stricter - must be well centered
+        SIZE_MIN = 0.18     # Slightly larger minimum size
+        SIZE_MAX = 0.45
+        
+        # Head pose thresholds - STRICT (degrees)
+        YAW_THRESHOLD = 5     # User must look directly at camera
+        PITCH_THRESHOLD = 8   # Slight tolerance for pitch
+        
+        # Calculate guidance
+        guidance = {'horizontal': 'ok', 'vertical': 'ok', 'distance': 'ok', 'look': 'ok'}
+        
+        # Position guidance
+        if center_x < TARGET_X - TOLERANCE_X:
+            guidance['horizontal'] = 'right'
+        elif center_x > TARGET_X + TOLERANCE_X:
+            guidance['horizontal'] = 'left'
+            
+        if center_y < TARGET_Y - TOLERANCE_Y:
+            guidance['vertical'] = 'down'
+        elif center_y > TARGET_Y + TOLERANCE_Y:
+            guidance['vertical'] = 'up'
+            
+        if face_size < SIZE_MIN:
+            guidance['distance'] = 'closer'
+        elif face_size > SIZE_MAX:
+            guidance['distance'] = 'back'
+        
+        # Head pose guidance (looking direction)
+        if yaw is not None:
+            if yaw < -YAW_THRESHOLD:
+                guidance['look'] = 'look_right'  # User looking left, tell them to look right
+            elif yaw > YAW_THRESHOLD:
+                guidance['look'] = 'look_left'   # User looking right, tell them to look left
+        
+        if pitch is not None:
+            if pitch < -PITCH_THRESHOLD:
+                guidance['look'] = 'look_down'   # User looking up
+            elif pitch > PITCH_THRESHOLD:
+                guidance['look'] = 'look_up'     # User looking down
+        
+        # Check blur (only if position/pose are OK to avoid unnecessary computation)
+        is_sharp = True
+        blur_score = 0.0
+        position_ok = (
+            guidance['horizontal'] == 'ok' and 
+            guidance['vertical'] == 'ok' and 
+            guidance['distance'] == 'ok' and
+            guidance['look'] == 'ok'
+        )
+        
+        if position_ok:
+            is_sharp, blur_score = self._check_blur(image, (x, y, fw, fh))
+            if not is_sharp:
+                guidance['blur'] = 'hold_still'  # Signal to hold still
+        
+        # Check if ALL conditions met (including sharpness)
+        is_positioned = position_ok and is_sharp
+        
+        return {
+            'detected': True,
+            'face_rect': [int(x), int(y), int(fw), int(fh)],
+            'center_x': float(center_x),
+            'center_y': float(center_y),
+            'face_size': float(face_size),
+            'head_pose': head_pose,
+            'guidance': guidance,
+            'is_positioned': is_positioned,
+            'blur_score': blur_score
+        }
+
+
+class PDService:
+    """PD measurement service using Roboflow ROI + MIDV500 segmentation."""
+    
+    def __init__(self):
+        print("Initializing PD Measurement Engine...")
+        self.pd_engine = PDMeasurement()
+        self.face_detector = FaceDetector()
+        
+        # Create inputs directory for saving debug images
+        self.inputs_base_dir = 'inputs'
+        os.makedirs(self.inputs_base_dir, exist_ok=True)
+    
+    def _create_session_dir(self) -> str:
+        """Create a timestamped session directory for debug images."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_dir = os.path.join(self.inputs_base_dir, timestamp)
+        os.makedirs(session_dir, exist_ok=True)
+        return session_dir
+    
+    def detect_face(self, image: np.ndarray) -> Dict[str, Any]:
+        """Detect face for guidance with head pose."""
+        return self.face_detector.detect(image)
+    
+    def measure_pd(self, image: np.ndarray) -> Dict[str, Any]:
+        """
+        Measure PD from image using Roboflow ROI + MIDV500 segmentation.
+        """
+        try:
+            # Create session directory for debug images
+            debug_dir = self._create_session_dir()
+            
+            # Save input image
+            input_path = os.path.join(debug_dir, "input.jpg")
+            cv2.imwrite(input_path, image)
+            print(f"[PDService] Saved input image to: {input_path}")
+            
+            # Use process_frame with debug_dir
+            # This uses Roboflow ROI + MIDV500 segmentation for card detection
+            result = self.pd_engine.process_frame(image, debug_dir=debug_dir)
+            
+            # Save annotated visualization
+            if result.is_valid:
+                annotated = self.pd_engine.visualize(image, result)
+                result_path = os.path.join(debug_dir, "result.jpg")
+                cv2.imwrite(result_path, annotated)
+                print(f"[PDService] Saved result to: {result_path}")
+            
+            if result.is_valid:
+                # Collect warnings
+                warnings = list(result.warnings) if result.warnings else []
+                
+                # Add warning if using iris fallback
+                if result.calibration_method in ['iris', 'fallback']:
+                    warnings.insert(0, 'Card not detected - using iris estimation')
+                elif not result.card_detected:
+                    warnings.insert(0, 'Card corners uncertain - lower accuracy')
+                
+                return {
+                    'success': True,
+                    'pd_mm': round(result.pd_final_mm, 1),
+                    'confidence': round(result.confidence, 2),
+                    'error': None,
+                    'debug_dir': debug_dir,
+                    'details': {
+                        'raw_pd_px': result.raw_pd_px,
+                        'scale_factor': result.scale_factor_mm_per_px,
+                        'method': result.calibration_method,
+                        'camera_distance_mm': result.camera_distance_mm,
+                        'warnings': warnings,
+                        'head_pose': {
+                            'yaw': result.head_pose.yaw if result.head_pose else None,
+                            'pitch': result.head_pose.pitch if result.head_pose else None,
+                            'roll': result.head_pose.roll if result.head_pose else None
+                        } if result.head_pose else None
+                    }
+                }
+            else:
+                # Save error info
+                error_path = os.path.join(debug_dir, "error.txt")
+                with open(error_path, 'w') as f:
+                    f.write(f"Errors: {result.errors}\n")
+                    f.write(f"Warnings: {result.warnings}\n")
+                
+                return {
+                    'success': False,
+                    'pd_mm': None,
+                    'confidence': 0,
+                    'error': 'Could not measure PD - check card visibility',
+                    'debug_dir': debug_dir,
+                    'details': {
+                        'warnings': result.warnings,
+                        'errors': result.errors
+                    }
+                }
+        except Exception as e:
+            import traceback
+            print(f"[PDService] Error: {e}")
+            traceback.print_exc()
+            return {
+                'success': False,
+                'pd_mm': None,
+                'confidence': 0,
+                'error': str(e),
+                'details': {}
+            }
+
+
+# Singleton instance
+_pd_service = None
+
+def get_pd_service() -> PDService:
+    global _pd_service
+    if _pd_service is None:
+        _pd_service = PDService()
+    return _pd_service
