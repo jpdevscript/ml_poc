@@ -1,0 +1,25 @@
+name: Deploy to Digital Ocean
+
+on:
+  push:
+    branches:
+      - main  # Trigger on push to main branch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Deploy to Droplet
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.DROPLET_IP }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          script: |
+            cd /opt/pd-api/ml_poc
+            git pull origin main
+            source .venv/bin/activate
+            pip install -e . --quiet
+            sudo systemctl restart pd-api
+            echo "Deployment completed at $(date)"
