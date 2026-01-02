@@ -307,3 +307,57 @@ class PDCorrector:
         
         scale_factor = avg_iris_diameter_mm / iris_diameter_px
         return raw_pd_px * scale_factor
+
+    @staticmethod
+    def estimate_camera_distance_from_iris(
+        iris_diameter_px: float,
+        focal_length_px: float,
+        avg_iris_diameter_mm: float = 11.7
+    ) -> float:
+        """
+        Estimate camera distance using the iris diameter constant.
+        
+        The human iris has a nearly constant horizontal diameter of 11.7mm (±0.5mm).
+        Using the pinhole camera model:
+        
+            d_camera = (iris_diameter_mm × focal_length_px) / iris_diameter_px
+        
+        This provides a more accurate camera distance estimate than assumptions,
+        which improves depth correction accuracy.
+        
+        Args:
+            iris_diameter_px: Detected iris diameter in pixels
+            focal_length_px: Camera focal length in pixels (from EXIF or estimated)
+            avg_iris_diameter_mm: Average iris diameter (default: 11.7mm)
+            
+        Returns:
+            Estimated camera distance in mm
+        """
+        if iris_diameter_px <= 0 or focal_length_px <= 0:
+            return 400.0  # Default fallback
+        
+        distance = (avg_iris_diameter_mm * focal_length_px) / iris_diameter_px
+        
+        # Sanity check - clamp to reasonable range (200mm to 1000mm)
+        return max(200.0, min(1000.0, distance))
+    
+    @staticmethod
+    def estimate_focal_length_px(image_width: int, fov_degrees: float = 60.0) -> float:
+        """
+        Estimate focal length in pixels from image width and field of view.
+        
+        Most smartphone front cameras have FOV around 60-70 degrees.
+        
+        Formula: f_px = (width / 2) / tan(FOV / 2)
+        
+        Args:
+            image_width: Image width in pixels
+            fov_degrees: Horizontal field of view in degrees (default: 60°)
+            
+        Returns:
+            Estimated focal length in pixels
+        """
+        fov_radians = math.radians(fov_degrees / 2)
+        focal_length = (image_width / 2) / math.tan(fov_radians)
+        return focal_length
+

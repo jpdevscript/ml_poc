@@ -272,11 +272,22 @@ class PDMeasurement:
             
             if scale_factor is None and self.fallback_to_iris:
                 # Fallback: Use iris diameter estimation
-                # Calibrated to 11.0mm based on known PD measurements
-                iris_size = self._estimate_iris_size(iris_result)
-                if iris_size > 0:
-                    scale_factor = 11.0 / iris_size
+                # Average human iris diameter is 11.7mm (range: 10.5-13mm)
+                iris_size = iris_result.iris_diameter_px if iris_result.iris_diameter_px else self._estimate_iris_size(iris_result)
+                if iris_size and iris_size > 0:
+                    # Use 11.7mm as the medical standard iris diameter
+                    scale_factor = 11.7 / iris_size
                     result.calibration_method = "iris"
+                    
+                    # Estimate camera distance from iris diameter for better depth correction
+                    # This uses the pinhole camera model: d = (iris_mm * focal_px) / iris_px
+                    focal_length = PDCorrector.estimate_focal_length_px(frame.shape[1])
+                    camera_distance = PDCorrector.estimate_camera_distance_from_iris(
+                        iris_diameter_px=iris_size,
+                        focal_length_px=focal_length,
+                        avg_iris_diameter_mm=11.7
+                    )
+                    
                     result.warnings.append(
                         "No card detected. Using iris diameter estimation (less accurate)."
                     )

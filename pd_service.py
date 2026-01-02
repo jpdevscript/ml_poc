@@ -375,6 +375,196 @@ class PDService:
                 'error': str(e),
                 'details': {}
             }
+    
+    def measure_pd_multi(self, images: list) -> Dict[str, Any]:
+        """
+        Measure PD from multiple images and perform statistical averaging.
+        Uses IQR outlier rejection for robust estimation.
+        
+        Args:
+            images: List of numpy arrays (BGR images)
+            
+        Returns:
+            Dict with averaged PD value and statistical info
+        """
+        try:
+            import time
+            start_time = time.time()
+            
+            # Create session directory for debug images
+            debug_dir = self._create_session_dir()
+            
+            # Process each frame sequentially (MediaPipe is NOT thread-safe)
+            pd_values = []
+            individual_results = []
+            
+            for i, image in enumerate(images):
+                # Create per-frame debug subdirectory
+                frame_debug_dir = os.path.join(debug_dir, f"frame_{i:02d}")
+                os.makedirs(frame_debug_dir, exist_ok=True)
+                
+                # Save input image
+                input_path = os.path.join(frame_debug_dir, "input.jpg")
+                cv2.imwrite(input_path, image)
+                
+                # === QUALITY GATE 1: Blur Detection ===
+                is_sharp, blur_score = self.face_detector._check_blur(image)
+                if not is_sharp:
+                    print(f"[PDService] Frame {i} rejected: too blurry (score={blur_score:.1f})")
+                    individual_results.append({
+                        'frame': i,
+                        'valid': False,
+                        'pd_mm': None,
+                        'confidence': 0,
+                        'rejection_reason': f'blurry (score={blur_score:.1f})'
+                    })
+                    continue
+                
+                # === QUALITY GATE 2: Head Pose Check ===
+                # Pre-check head pose before full processing
+                face_result = self.face_detector.detect(image)
+                if face_result.get('detected', False):
+                    yaw = face_result.get('yaw', 0)
+                    pitch = face_result.get('pitch', 0)
+                    
+                    # Stricter thresholds for medical-grade accuracy
+                    MAX_YAW = 10.0  # degrees
+                    MAX_PITCH = 10.0  # degrees
+                    
+                    if abs(yaw) > MAX_YAW or abs(pitch) > MAX_PITCH:
+                        print(f"[PDService] Frame {i} rejected: pose out of range (yaw={yaw:.1f}, pitch={pitch:.1f})")
+                        individual_results.append({
+                            'frame': i,
+                            'valid': False,
+                            'pd_mm': None,
+                            'confidence': 0,
+                            'rejection_reason': f'head pose out of range (yaw={yaw:.1f}°, pitch={pitch:.1f}°)'
+                        })
+                        continue
+                
+                # Process frame with debug enabled for this frame
+                try:
+                    result = self.pd_engine.process_frame(image, debug_dir=frame_debug_dir)
+                    frame_result = {
+                        'frame': i,
+                        'valid': result.is_valid,
+                        'pd_mm': round(result.pd_final_mm, 2) if result.is_valid else None,
+                        'confidence': round(result.confidence, 2) if result.is_valid else 0,
+                        'blur_score': round(blur_score, 1)
+                    }
+                    if result.is_valid:
+                        pd_values.append(result.pd_final_mm)
+                except Exception as e:
+                    print(f"[PDService] Frame {i} error: {e}")
+                    frame_result = {
+                        'frame': i,
+                        'valid': False,
+                        'pd_mm': None,
+                        'confidence': 0
+                    }
+                individual_results.append(frame_result)
+            
+            elapsed = time.time() - start_time
+            print(f"[PDService] Multi-frame: {len(pd_values)}/{len(images)} valid frames in {elapsed:.2f}s")
+            
+            if len(pd_values) < 2:
+                # Not enough valid frames
+                return {
+                    'success': False,
+                    'pd_mm': None,
+                    'confidence': 0,
+                    'error': f'Only {len(pd_values)} valid frames detected. Need at least 2.',
+                    'debug_dir': debug_dir,
+                    'details': {
+                        'frames_total': len(images),
+                        'frames_valid': len(pd_values),
+                        'individual_results': individual_results
+                    }
+                }
+            
+            # Statistical averaging with IQR outlier rejection
+            pd_array = np.array(pd_values)
+            
+            # Calculate IQR bounds
+            q1 = np.percentile(pd_array, 25)
+            q3 = np.percentile(pd_array, 75)
+            iqr = q3 - q1
+            
+            # For small sample sizes, use a tighter multiplier
+            multiplier = 1.5 if len(pd_values) >= 5 else 2.0
+            lower_bound = q1 - multiplier * iqr
+            upper_bound = q3 + multiplier * iqr
+            
+            # Filter outliers
+            valid_mask = (pd_array >= lower_bound) & (pd_array <= upper_bound)
+            filtered_values = pd_array[valid_mask]
+            
+            # If too many outliers removed, use all values
+            if len(filtered_values) < 2:
+                filtered_values = pd_array
+                outliers_removed = 0
+            else:
+                outliers_removed = len(pd_values) - len(filtered_values)
+            
+            # Calculate final statistics
+            mean_pd = float(np.mean(filtered_values))
+            std_pd = float(np.std(filtered_values))
+            median_pd = float(np.median(filtered_values))
+            
+            # Confidence based on frame count and consistency
+            base_confidence = min(len(filtered_values) / 5, 1.0)  # Max confidence at 5+ frames
+            consistency_bonus = max(0, 1 - (std_pd / mean_pd) * 10) if mean_pd > 0 else 0  # Lower std = higher confidence
+            final_confidence = 0.7 * base_confidence + 0.3 * consistency_bonus
+            
+            # Save summary result
+            summary_path = os.path.join(debug_dir, "summary.txt")
+            with open(summary_path, 'w') as f:
+                f.write(f"Multi-frame PD Measurement Summary\n")
+                f.write(f"==================================\n")
+                f.write(f"Total frames: {len(images)}\n")
+                f.write(f"Valid frames: {len(pd_values)}\n")
+                f.write(f"Frames after outlier removal: {len(filtered_values)}\n")
+                f.write(f"Outliers removed: {outliers_removed}\n")
+                f.write(f"\nStatistics:\n")
+                f.write(f"  Mean PD: {mean_pd:.2f} mm\n")
+                f.write(f"  Median PD: {median_pd:.2f} mm\n")
+                f.write(f"  Std Dev: {std_pd:.2f} mm\n")
+                f.write(f"  Confidence: {final_confidence:.2f}\n")
+                f.write(f"\nIndividual values: {pd_values}\n")
+                f.write(f"Filtered values: {filtered_values.tolist()}\n")
+            
+            print(f"[PDService] Multi-frame result: PD={mean_pd:.2f}mm, std={std_pd:.2f}mm, conf={final_confidence:.2f}")
+            
+            return {
+                'success': True,
+                'pd_mm': round(mean_pd, 1),
+                'confidence': round(final_confidence, 2),
+                'error': None,
+                'debug_dir': debug_dir,
+                'details': {
+                    'method': 'multi_frame_average',
+                    'frames_total': len(images),
+                    'frames_valid': len(pd_values),
+                    'frames_used': len(filtered_values),
+                    'outliers_removed': outliers_removed,
+                    'std_mm': round(std_pd, 2),
+                    'median_mm': round(median_pd, 1),
+                    'individual_results': individual_results,
+                    'warnings': [] if std_pd < 1.0 else ['High variance between frames - measurement may be less accurate']
+                }
+            }
+            
+        except Exception as e:
+            import traceback
+            print(f"[PDService] Multi-frame error: {e}")
+            traceback.print_exc()
+            return {
+                'success': False,
+                'pd_mm': None,
+                'confidence': 0,
+                'error': str(e),
+                'details': {}
+            }
 
 
 # Singleton instance

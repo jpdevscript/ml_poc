@@ -40,6 +40,7 @@ class IrisMeasurement:
     left_iris: Optional[Tuple[float, float]] = None  # (x, y) in pixels
     right_iris: Optional[Tuple[float, float]] = None  # (x, y) in pixels
     raw_pd_px: Optional[float] = None  # Raw PD in pixels
+    iris_diameter_px: Optional[float] = None  # Average iris diameter in pixels
     head_pose: Optional[HeadPose] = None
     face_landmarks: Optional[np.ndarray] = None
     confidence: float = 0.0
@@ -165,6 +166,22 @@ class IrisMeasurer:
         # Calculate raw PD in pixels
         raw_pd_px = euclidean_distance(left_iris, right_iris)
         
+        # Calculate iris diameter (using horizontal iris landmarks)
+        # Left iris: 469 (right), 471 (left) - horizontal diameter
+        # Right iris: 474 (right), 476 (left) - horizontal diameter
+        try:
+            left_iris_width = euclidean_distance(
+                (landmarks_px[469][0], landmarks_px[469][1]),
+                (landmarks_px[471][0], landmarks_px[471][1])
+            )
+            right_iris_width = euclidean_distance(
+                (landmarks_px[474][0], landmarks_px[474][1]),
+                (landmarks_px[476][0], landmarks_px[476][1])
+            )
+            iris_diameter_px = (left_iris_width + right_iris_width) / 2
+        except IndexError:
+            iris_diameter_px = None
+        
         # Estimate head pose
         head_pose = self._estimate_head_pose(landmarks_px, image.shape)
         
@@ -184,6 +201,7 @@ class IrisMeasurer:
             left_iris=left_iris,
             right_iris=right_iris,
             raw_pd_px=raw_pd_px,
+            iris_diameter_px=iris_diameter_px,
             head_pose=head_pose,
             face_landmarks=landmarks_px,
             confidence=confidence,
