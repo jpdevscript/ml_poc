@@ -407,6 +407,41 @@ class PDService:
                 input_path = os.path.join(frame_debug_dir, "input.jpg")
                 cv2.imwrite(input_path, image)
                 
+                # === QUALITY GATE 1: Blur Detection ===
+                is_sharp, blur_score = self.face_detector._check_blur(image)
+                if not is_sharp:
+                    print(f"[PDService] Frame {i} rejected: too blurry (score={blur_score:.1f})")
+                    individual_results.append({
+                        'frame': i,
+                        'valid': False,
+                        'pd_mm': None,
+                        'confidence': 0,
+                        'rejection_reason': f'blurry (score={blur_score:.1f})'
+                    })
+                    continue
+                
+                # === QUALITY GATE 2: Head Pose Check ===
+                # Pre-check head pose before full processing
+                face_result = self.face_detector.detect(image)
+                if face_result.get('detected', False):
+                    yaw = face_result.get('yaw', 0)
+                    pitch = face_result.get('pitch', 0)
+                    
+                    # Stricter thresholds for medical-grade accuracy
+                    MAX_YAW = 10.0  # degrees
+                    MAX_PITCH = 10.0  # degrees
+                    
+                    if abs(yaw) > MAX_YAW or abs(pitch) > MAX_PITCH:
+                        print(f"[PDService] Frame {i} rejected: pose out of range (yaw={yaw:.1f}, pitch={pitch:.1f})")
+                        individual_results.append({
+                            'frame': i,
+                            'valid': False,
+                            'pd_mm': None,
+                            'confidence': 0,
+                            'rejection_reason': f'head pose out of range (yaw={yaw:.1f}°, pitch={pitch:.1f}°)'
+                        })
+                        continue
+                
                 # Process frame with debug enabled for this frame
                 try:
                     result = self.pd_engine.process_frame(image, debug_dir=frame_debug_dir)
@@ -414,7 +449,8 @@ class PDService:
                         'frame': i,
                         'valid': result.is_valid,
                         'pd_mm': round(result.pd_final_mm, 2) if result.is_valid else None,
-                        'confidence': round(result.confidence, 2) if result.is_valid else 0
+                        'confidence': round(result.confidence, 2) if result.is_valid else 0,
+                        'blur_score': round(blur_score, 1)
                     }
                     if result.is_valid:
                         pd_values.append(result.pd_final_mm)
