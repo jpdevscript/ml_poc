@@ -50,7 +50,9 @@ class FaceDetector:
         Returns:
             (is_sharp, blur_score) - True if sharp enough, and the blur score
         """
-        BLUR_THRESHOLD = 50.0  # Lower = more blurry
+        # Lower threshold = more likely to reject. 30 is permissive but catches very blurry.
+        # Typical values: sharp=100+, slightly soft=50-100, blurry=20-50, very blurry=<20
+        BLUR_THRESHOLD = 30.0
         
         if face_rect is not None:
             x, y, w, h = face_rect
@@ -427,9 +429,9 @@ class PDService:
                     yaw = face_result.get('yaw', 0)
                     pitch = face_result.get('pitch', 0)
                     
-                    # Stricter thresholds for medical-grade accuracy
-                    MAX_YAW = 10.0  # degrees
-                    MAX_PITCH = 10.0  # degrees
+                    # Relaxed thresholds - 15 degrees allows for natural head movement
+                    MAX_YAW = 15.0  # degrees
+                    MAX_PITCH = 15.0  # degrees
                     
                     if abs(yaw) > MAX_YAW or abs(pitch) > MAX_PITCH:
                         print(f"[PDService] Frame {i} rejected: pose out of range (yaw={yaw:.1f}, pitch={pitch:.1f})")
@@ -441,6 +443,8 @@ class PDService:
                             'rejection_reason': f'head pose out of range (yaw={yaw:.1f}°, pitch={pitch:.1f}°)'
                         })
                         continue
+                    else:
+                        print(f"[PDService] Frame {i} passed quality gates (blur={blur_score:.1f}, yaw={yaw:.1f}°, pitch={pitch:.1f}°)")
                 
                 # Process frame with debug enabled for this frame
                 try:

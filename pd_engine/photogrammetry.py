@@ -671,18 +671,18 @@ def simple_pd_from_scale(
     debug: bool = False
 ) -> PhotogrammetryResult:
     """
-    SIMPLE, ROBUST PD calculation using diagonal scale factor.
+    SIMPLE, ROBUST PD calculation using card dimensions for scale factor.
     
     Method:
-    1. Use ONLY diagonal for scale (most stable, least perspective-affected)
-    2. PD = pupil_pixel_distance × scale_factor
-    3. No corrections - keep it simple
+    1. Detect card orientation (landscape vs portrait)
+    2. Use LONGER edge for scale (always maps to 85.6mm width)
+    3. PD = horizontal_pupil_distance × scale_factor
     """
     result = PhotogrammetryResult(success=False)
     result.warnings = []
     
     if debug:
-        print("\n[PD] === Diagonal Scale Method ===")
+        print("\n[PD] === Scale Method with Orientation Detection ===")
     
     # Order corners: TL, TR, BR, BL
     corners = card_corners.reshape(-1, 2).astype(np.float64)
@@ -699,32 +699,47 @@ def simple_pd_from_scale(
     TL, TR = top_two[0], top_two[1]
     BL, BR = bottom_two[0], bottom_two[1]
     
-    # ONLY use diagonal - most stable measurement
-    card_diagonal_mm = np.sqrt(CARD_WIDTH_MM**2 + CARD_HEIGHT_MM**2)  # 101.19 mm
+    # Calculate both dimensions
+    top_edge_px = np.linalg.norm(TR - TL)
+    bottom_edge_px = np.linalg.norm(BR - BL)
+    left_edge_px = np.linalg.norm(BL - TL)
+    right_edge_px = np.linalg.norm(BR - TR)
     
-    diag1_px = np.linalg.norm(BR - TL)
-    diag2_px = np.linalg.norm(BL - TR)
+    # Average horizontal and vertical edges
+    horizontal_px = (top_edge_px + bottom_edge_px) / 2.0
+    vertical_px = (left_edge_px + right_edge_px) / 2.0
     
-    # Average both diagonals (they should be nearly equal for a card)
-    avg_diag_px = (diag1_px + diag2_px) / 2.0
+    # Determine orientation: LONGER edge is always the card WIDTH (85.6mm)
+    if horizontal_px >= vertical_px:
+        # Landscape orientation - horizontal edge is width
+        card_width_px = horizontal_px
+        card_mm = CARD_WIDTH_MM  # 85.6mm
+        orientation = "landscape"
+    else:
+        # Portrait orientation - vertical edge is width
+        card_width_px = vertical_px
+        card_mm = CARD_WIDTH_MM  # 85.6mm (vertical edge is the physical width)
+        orientation = "portrait"
     
-    # Scale factor: mm per pixel (direct calculation, no calibration adjustment)
-    scale_factor = card_diagonal_mm / avg_diag_px
+    # Scale factor: mm per pixel
+    scale_factor = card_mm / card_width_px
     
     if debug:
-        print(f"   Diagonals: {diag1_px:.1f}, {diag2_px:.1f} px → avg: {avg_diag_px:.1f}")
+        print(f"   Horizontal edge: {horizontal_px:.1f} px")
+        print(f"   Vertical edge: {vertical_px:.1f} px")
+        print(f"   Orientation: {orientation}")
+        print(f"   Using {card_width_px:.1f} px = {card_mm}mm")
         print(f"   Scale: {scale_factor:.4f} mm/px")
     
-    # Calculate pupil distance using ONLY horizontal component
-    # (vertical differences are usually due to head tilt, not actual PD)
+    # Calculate pupil distance using horizontal component in image
     pupil_dx = abs(pupil_right_px[0] - pupil_left_px[0])
     pupil_dy = abs(pupil_right_px[1] - pupil_left_px[1])
     
-    # If significant vertical offset, warn but still use full distance
+    # If significant vertical offset, warn
     if pupil_dy > pupil_dx * 0.1:  # More than 10% tilt
         result.warnings.append(f"Head may be tilted (dy={pupil_dy:.1f}px)")
     
-    # Use horizontal distance for PD (more stable)
+    # Use horizontal distance for PD
     pupil_dist_px = pupil_dx
     
     # Raw PD in mm
@@ -735,13 +750,13 @@ def simple_pd_from_scale(
         print(f"   PD: {pd_mm:.2f} mm")
     
     # Estimate camera distance
-    camera_distance = 400 * (0.5 / scale_factor)
+    camera_distance = card_mm / scale_factor * 0.5  # Rough estimate
     
     result.success = True
     result.pd_near_mm = pd_mm
-    result.pd_far_mm = pd_mm + FAR_PD_ADJUSTMENT
+    result.pd_far_mm = pd_mm  # No adjustment
     result.camera_distance_mm = camera_distance
-    result.validation_info = {'scale_factor': scale_factor, 'diag_px': avg_diag_px}
+    result.validation_info = {'scale_factor': scale_factor, 'orientation': orientation}
     
     if debug:
         print(f"\n[PD] === RESULT: {pd_mm:.2f} mm ===")
