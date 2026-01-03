@@ -19,6 +19,7 @@ from .utils import (
     calculate_camera_distance,
     draw_landmarks_on_image,
     CARD_WIDTH_MM,
+    extract_camera_intrinsics_from_exif,
 )
 
 
@@ -229,7 +230,17 @@ class PDMeasurement:
                 result.scale_factor_mm_per_px = card_result.scale_factor
                 result.calibration_method = "card_3d"
                 
-                # Use 3D photogrammetric calculation
+                # IMPROVEMENT: Extract real camera intrinsics from EXIF if available
+                camera_intrinsics = extract_camera_intrinsics_from_exif(image_array=frame)
+                K = None
+                D = None
+                if camera_intrinsics:
+                    K, D = camera_intrinsics
+                    print(f"[Core] Using EXIF camera calibration: fx={K[0,0]:.1f}px")
+                else:
+                    print(f"[Core] EXIF not available, using estimated intrinsics")
+                
+                # IMPROVEMENT: Use full 3D photogrammetric calculation
                 photo_result = calculate_precise_pd(
                     card_corners=card_result.corners,
                     pupil_left_px=result.left_iris_px,
@@ -237,6 +248,8 @@ class PDMeasurement:
                     image_shape=frame.shape[:2],
                     image=frame,
                     head_pose=result.head_pose,
+                    K=K,  # Real camera intrinsics
+                    D=D,  # Real distortion coefficients
                     debug_dir=debug_dir,
                     debug=bool(debug_dir)
                 )

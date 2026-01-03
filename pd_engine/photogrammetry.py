@@ -777,12 +777,45 @@ def calculate_precise_pd(
     debug: bool = False
 ) -> PhotogrammetryResult:
     """
-    Calculate PD using simple, robust scale-factor method.
+    Calculate PD using full 3D photogrammetric method when camera intrinsics available,
+    otherwise fallback to simple scale method.
     
-    This replaces the complex 3D ray-plane intersection with a much simpler
-    and more robust approach that gives consistent results.
+    IMPROVEMENT: Now uses full 3D ray-plane intersection when camera calibration is available.
     """
-    # Use the simple robust method
+    # IMPROVEMENT: Use full 3D method if camera intrinsics provided
+    if K is not None and image is not None:
+        calculator = PhotogrammetricPDCalculator(debug_dir=debug_dir)
+        
+        # Convert head_pose to dict format if needed
+        head_pose_dict = None
+        if head_pose is not None:
+            if hasattr(head_pose, 'yaw'):
+                head_pose_dict = {
+                    'yaw': head_pose.yaw,
+                    'pitch': head_pose.pitch,
+                    'roll': head_pose.roll
+                }
+            elif isinstance(head_pose, dict):
+                head_pose_dict = head_pose
+        
+        result = calculator.calculate(
+            image=image,
+            card_corners=card_corners,
+            pupil_left_px=pupil_left_px,
+            pupil_right_px=pupil_right_px,
+            head_pose=head_pose_dict,
+            K=K,
+            D=D
+        )
+        
+        if result.success:
+            return result
+        else:
+            # Fallback to simple method if 3D fails
+            if debug:
+                print(f"[Photogrammetry] 3D method failed: {result.error_message}, using scale method")
+    
+    # Fallback: Use the simple robust method
     return simple_pd_from_scale(
         card_corners=card_corners,
         pupil_left_px=pupil_left_px,

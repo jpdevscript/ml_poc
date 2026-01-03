@@ -17,6 +17,7 @@ from .utils import (
     MAX_YAW_DEGREES,
     euclidean_distance,
     rotation_matrix_to_euler_angles,
+    refine_iris_centers_subpixel,
 )
 
 
@@ -155,13 +156,18 @@ class IrisMeasurer:
         # Extract iris centers (landmarks 468 and 473)
         # Note: These are available only with refine_landmarks=True
         try:
-            left_iris = (landmarks_px[LEFT_IRIS_CENTER][0], landmarks_px[LEFT_IRIS_CENTER][1])
-            right_iris = (landmarks_px[RIGHT_IRIS_CENTER][0], landmarks_px[RIGHT_IRIS_CENTER][1])
+            left_iris_approx = (landmarks_px[LEFT_IRIS_CENTER][0], landmarks_px[LEFT_IRIS_CENTER][1])
+            right_iris_approx = (landmarks_px[RIGHT_IRIS_CENTER][0], landmarks_px[RIGHT_IRIS_CENTER][1])
         except IndexError:
             return IrisMeasurement(
                 detected=False,
                 error_message="Iris landmarks not available. Ensure refine_landmarks=True"
             )
+        
+        # IMPROVEMENT: Refine iris centers to sub-pixel accuracy
+        left_iris, right_iris = refine_iris_centers_subpixel(
+            image, left_iris_approx, right_iris_approx, roi_size=50
+        )
         
         # Calculate raw PD in pixels
         raw_pd_px = euclidean_distance(left_iris, right_iris)
@@ -182,8 +188,8 @@ class IrisMeasurer:
         except IndexError:
             iris_diameter_px = None
         
-        # Estimate head pose
-        head_pose = self._estimate_head_pose(landmarks_px, image.shape)
+        # IMPROVEMENT: Estimate head pose with enhanced PnP method
+        head_pose = self._estimate_head_pose(landmarks_px, image.shape, use_pnp=True)
         
         # Generate warnings
         warnings = []
@@ -211,17 +217,19 @@ class IrisMeasurer:
     def _estimate_head_pose(
         self,
         landmarks_px: np.ndarray,
-        image_shape: Tuple[int, ...]
+        image_shape: Tuple[int, ...],
+        use_pnp: bool = True
     ) -> Optional[HeadPose]:
         """
         Estimate 3D head pose from facial landmarks.
         
-        Uses a simpler, more robust approach based on key facial landmarks
-        to estimate head rotation.
+        IMPROVEMENT: Uses PnP with 3D face model for more accurate pose estimation.
+        Falls back to simple method if PnP fails.
         
         Args:
             landmarks_px: Array of landmark pixel coordinates
             image_shape: Image shape (h, w, c)
+            use_pnp: Whether to use PnP method (default: True)
             
         Returns:
             HeadPose with roll, pitch, yaw angles
@@ -229,6 +237,60 @@ class IrisMeasurer:
         import math
         
         try:
+            h, w = image_shape[:2] if len(image_shape) >= 2 else (image_shape[0], image_shape[1] if len(image_shape) > 1 else image_shape[0])
+            
+            # IMPROVEMENT: Try PnP method first for better accuracy
+            if use_pnp:
+                try:
+                    # 3D face model points (in mm, relative to face center)
+                    # Based on average human face dimensions
+                    model_points_3d = np.array([
+                        [0.0, 0.0, 0.0],          # Nose tip (landmark 1)
+                        [0.0, -125.0, -20.0],     # Chin (landmark 152)
+                        [-50.0, 0.0, -30.0],      # Left eye outer (landmark 33)
+                        [50.0, 0.0, -30.0],       # Right eye outer (landmark 263)
+                        [-35.0, -50.0, -25.0],    # Left mouth corner (landmark 61)
+                        [35.0, -50.0, -25.0],     # Right mouth corner (landmark 291)
+                    ], dtype=np.float64)
+                    
+                    # Corresponding 2D image points
+                    image_points_2d = np.array([
+                        landmarks_px[1][:2],      # Nose tip
+                        landmarks_px[152][:2],    # Chin
+                        landmarks_px[33][:2],     # Left eye
+                        landmarks_px[263][:2],    # Right eye
+                        landmarks_px[61][:2],     # Left mouth
+                        landmarks_px[291][:2],    # Right mouth
+                    ], dtype=np.float64)
+                    
+                    # Estimate camera matrix (will be refined if card detected)
+                    focal_length = w  # Rough estimate
+                    camera_matrix = np.array([
+                        [focal_length, 0, w / 2],
+                        [0, focal_length, h / 2],
+                        [0, 0, 1]
+                    ], dtype=np.float64)
+                    
+                    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+                    
+                    # Solve PnP
+                    success, rvec, tvec = cv2.solvePnP(
+                        model_points_3d, image_points_2d, camera_matrix, dist_coeffs
+                    )
+                    
+                    if success:
+                        # Convert rotation vector to matrix
+                        R, _ = cv2.Rodrigues(rvec)
+                        
+                        # Convert to Euler angles
+                        roll, pitch, yaw = rotation_matrix_to_euler_angles(R)
+                        
+                        return HeadPose(roll=roll, pitch=pitch, yaw=yaw)
+                except Exception:
+                    # Fall through to simple method
+                    pass
+            
+            # Fallback: Simple method (original implementation)
             # Use key landmarks for pose estimation
             # Nose tip: 1, Left eye outer: 33, Right eye outer: 263
             # Left mouth: 61, Right mouth: 291, Forehead: 10

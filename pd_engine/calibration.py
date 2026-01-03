@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 from .forehead_detection import ForeheadDetector, ForeheadROI
 from .sam3_segmentation import SAM3Segmenter, SAM3SegmentationResult
+from .utils import validate_card_flatness
 
 load_dotenv()
 
@@ -289,12 +290,13 @@ class CardCalibration:
     
     def _detect_card_corners(self, mask: np.ndarray, roi: np.ndarray, debug: bool = False) -> Optional[np.ndarray]:
         """
-        Detect card corners from segmentation mask using multiple methods.
+        Detect card corners from segmentation mask using multiple methods with voting.
         
-        Approach:
+        Enhanced approach:
         1. Find the largest contour
-        2. Try approxPolyDP to get 4 corners directly
-        3. Fallback to minAreaRect corners
+        2. Try multiple corner detection methods
+        3. Validate and vote for best corners
+        4. Refine to sub-pixel accuracy
         
         Args:
             mask: Binary mask (0/1 or 0/255)
@@ -325,22 +327,70 @@ class CardCalibration:
             cv2.drawContours(contour_debug, [largest], -1, (0, 255, 0), 2)
             cv2.imwrite(os.path.join(self.debug_dir, "contour.jpg"), contour_debug)
         
-        # Method 1: Try approxPolyDP to get 4 corners directly
+        # Multiple detection methods
+        methods = []
+        
+        # Method 1: approxPolyDP
         epsilon = 0.02 * cv2.arcLength(largest, True)
         approx = cv2.approxPolyDP(largest, epsilon, True)
-        
         if len(approx) == 4:
-            # Got exactly 4 corners - perfect!
-            corners = approx.reshape(4, 2).astype(np.float32)
-            method = "approxPolyDP"
-        else:
-            # Method 2: Use minAreaRect
-            rect = cv2.minAreaRect(largest)
-            corners = cv2.boxPoints(rect).astype(np.float32)
-            method = "minAreaRect"
+            corners1 = approx.reshape(4, 2).astype(np.float32)
+            methods.append(('approxPolyDP', corners1))
         
-        # Order corners as TL, TR, BR, BL
-        corners = self._order_corners(corners)
+        # Method 2: minAreaRect
+        rect = cv2.minAreaRect(largest)
+        corners2 = cv2.boxPoints(rect).astype(np.float32)
+        methods.append(('minAreaRect', corners2))
+        
+        # Method 3: Harris corner detection on edges
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi
+        edges = cv2.Canny(gray_roi, 50, 150)
+        corners_harris = cv2.cornerHarris(edges, 2, 3, 0.04)
+        corners_harris = cv2.dilate(corners_harris, None)
+        
+        # Extract top 4 Harris corners
+        if np.max(corners_harris) > 0.01:
+            corner_coords = np.argwhere(corners_harris > 0.01 * corners_harris.max())
+            if len(corner_coords) >= 4:
+                # Get 4 corners closest to expected positions
+                corners3 = self._extract_harris_corners(corner_coords, roi.shape[:2])
+                if corners3 is not None:
+                    methods.append(('harris', corners3))
+        
+        # Method 4: Shi-Tomasi corner detection
+        corners_shitomasi = cv2.goodFeaturesToTrack(
+            edges, maxCorners=4, qualityLevel=0.01, minDistance=20
+        )
+        if corners_shitomasi is not None and len(corners_shitomasi) == 4:
+            corners4 = corners_shitomasi.reshape(4, 2).astype(np.float32)
+            methods.append(('shi-tomasi', corners4))
+        
+        # Validate and select best method
+        valid_corners = []
+        for method_name, corners in methods:
+            corners_ordered = self._order_corners(corners)
+            if self._validate_corners(corners_ordered):
+                valid_corners.append((method_name, corners_ordered))
+        
+        if not valid_corners:
+            # Fallback to first method
+            if methods:
+                corners = self._order_corners(methods[0][1])
+                method = methods[0][0]
+            else:
+                return None
+        elif len(valid_corners) == 1:
+            corners = valid_corners[0][1]
+            method = valid_corners[0][0]
+        else:
+            # Average valid corners
+            corners = np.mean([c for _, c in valid_corners], axis=0)
+            method = f"voted({len(valid_corners)} methods)"
+        
+        # Refine to sub-pixel accuracy
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi
+        from .utils import refine_corners_subpixel
+        corners = refine_corners_subpixel(gray_roi, corners, window_size=5)
         
         # Save corners debug
         if self.debug_dir:
@@ -360,6 +410,59 @@ class CardCalibration:
             print(f"  Corner detection method: {method}")
         
         return corners
+    
+    def _extract_harris_corners(self, corner_coords: np.ndarray, roi_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+        """Extract 4 corners from Harris corner detection results."""
+        if len(corner_coords) < 4:
+            return None
+        
+        # Convert to (x, y) format
+        points = corner_coords[:, [1, 0]].astype(np.float32)
+        
+        # Find corners closest to expected positions (TL, TR, BR, BL)
+        h, w = roi_shape
+        expected_positions = [
+            (w * 0.25, h * 0.25),  # TL
+            (w * 0.75, h * 0.25),  # TR
+            (w * 0.75, h * 0.75),  # BR
+            (w * 0.25, h * 0.75),  # BL
+        ]
+        
+        selected = []
+        used = set()
+        for exp_pos in expected_positions:
+            distances = [np.linalg.norm(p - exp_pos) for p in points]
+            best_idx = np.argmin(distances)
+            if best_idx not in used:
+                selected.append(points[best_idx])
+                used.add(best_idx)
+        
+        if len(selected) == 4:
+            return np.array(selected, dtype=np.float32)
+        return None
+    
+    def _validate_corners(self, corners: np.ndarray) -> bool:
+        """Validate that corners form a reasonable rectangle."""
+        if corners.shape != (4, 2):
+            return False
+        
+        # Check aspect ratio
+        width = np.linalg.norm(corners[1] - corners[0])
+        height = np.linalg.norm(corners[3] - corners[0])
+        
+        if height == 0:
+            return False
+        
+        aspect = width / height
+        # Card aspect ratio is ~1.586, allow 0.5-3.0 range
+        if aspect < 0.5 or aspect > 3.0:
+            return False
+        
+        # Check minimum size
+        if width < 50 or height < 30:
+            return False
+        
+        return True
     
     def _extract_convex_hull(self, mask: np.ndarray) -> Optional[np.ndarray]:
         """Extract convex hull from mask."""
@@ -826,6 +929,12 @@ class CardCalibration:
         # Check aspect ratio
         aspect = width_px / height_px
         aspect_error = abs(aspect - CARD_ASPECT_RATIO) / CARD_ASPECT_RATIO
+        
+        # IMPROVEMENT: Validate card flatness
+        is_flat, convexity_defect, flatness_info = validate_card_flatness(corners_global, image)
+        if not is_flat:
+            if debug:
+                print(f"   ⚠️ Card may be bent (convexity: {convexity_defect*100:.1f}%)")
         
         if aspect_error > 0.20:
             if debug:
