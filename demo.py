@@ -29,8 +29,8 @@ import numpy as np
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from backend.pd_engine.core import PDMeasurement, PDResult
-from backend.pd_engine.calibration import CardCalibration, CardDetectionResult
+from pd_engine.core import PDMeasurement, PDResult
+from pd_engine.calibration import CardCalibration, CardDetectionResult
 
 
 def create_debug_dir(base_dir: str = "debug") -> str:
@@ -122,7 +122,7 @@ def test_full_pd(
     use_forehead: bool = True
 ) -> Optional[PDResult]:
     """
-    Test full PD measurement pipeline.
+    Test full PD measurement pipeline with quality gates.
     
     Args:
         image_path: Path to input image
@@ -132,6 +132,9 @@ def test_full_pd(
     Returns:
         PDResult or None if failed
     """
+    from pd_engine.corrections import PDCorrector
+    from pd_engine.measurement import IrisMeasurer
+    
     print_header("FULL PD MEASUREMENT TEST")
     
     image = cv2.imread(image_path)
@@ -147,13 +150,48 @@ def test_full_pd(
     # Save input
     cv2.imwrite(os.path.join(debug_dir, "input.jpg"), image)
     
+    # === QUALITY GATE 1: Blur Detection ===
+    print_section("QUALITY GATES")
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    is_sharp = blur_score > 30.0
+    print(f"  Blur Score: {blur_score:.1f} (threshold=30)")
+    print(f"  Sharpness: {'✓ PASS' if is_sharp else '✗ FAIL - too blurry'}")
+    
+    # === QUALITY GATE 2: Iris Detection for camera distance ===
+    iris_measurer = IrisMeasurer()
+    iris_result = iris_measurer.measure(image)
+    iris_measurer.close()
+    
+    if iris_result.detected:
+        print(f"  Face Detection: ✓ PASS")
+        if iris_result.head_pose:
+            yaw = iris_result.head_pose.yaw
+            pitch = iris_result.head_pose.pitch
+            print(f"  Head Pose: yaw={yaw:.1f}°, pitch={pitch:.1f}°")
+            if abs(yaw) > 15 or abs(pitch) > 15:
+                print(f"    ⚠️ Pose outside recommended range (±15°)")
+            else:
+                print(f"    ✓ Pose OK")
+        
+        # Iris-based camera distance estimation
+        if iris_result.iris_diameter_px:
+            focal_length = PDCorrector.estimate_focal_length_px(w)
+            camera_dist = PDCorrector.estimate_camera_distance_from_iris(
+                iris_result.iris_diameter_px,
+                focal_length
+            )
+            print(f"  Iris Diameter: {iris_result.iris_diameter_px:.1f} px")
+            print(f"  Est. Camera Distance (from iris): {camera_dist:.0f} mm")
+    else:
+        print(f"  Face Detection: ✗ FAIL - {iris_result.error_message}")
+    
     # Create PD engine
+    print_section("PD MEASUREMENT")
     engine = PDMeasurement()
     
     try:
         result = engine.process_frame(image, debug_dir=debug_dir)
-        
-        print_section("RESULT")
         
         if result.is_valid:
             print(f"  ✓ PD: {result.pd_final_mm:.2f} mm")
