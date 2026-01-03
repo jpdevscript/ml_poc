@@ -12,6 +12,7 @@ from datetime import datetime
 import math
 
 from pd_engine.core import PDMeasurement
+from pd_engine.temporal_filter import TemporalPDFilter, filter_pd_sequence
 
 
 class FaceDetector:
@@ -458,6 +459,10 @@ class PDService:
                     }
                     if result.is_valid:
                         pd_values.append(result.pd_final_mm)
+                        # Store confidence for weighted averaging
+                        if not hasattr(self, '_pd_confidences'):
+                            self._pd_confidences = []
+                        self._pd_confidences.append(result.confidence)
                 except Exception as e:
                     print(f"[PDService] Frame {i} error: {e}")
                     frame_result = {
@@ -488,6 +493,7 @@ class PDService:
             
             # Statistical averaging with IQR outlier rejection
             pd_array = np.array(pd_values)
+            confidences_array = np.array(getattr(self, '_pd_confidences', [1.0] * len(pd_values)))
             
             # Calculate IQR bounds
             q1 = np.percentile(pd_array, 25)
@@ -502,22 +508,44 @@ class PDService:
             # Filter outliers
             valid_mask = (pd_array >= lower_bound) & (pd_array <= upper_bound)
             filtered_values = pd_array[valid_mask]
+            filtered_confidences = confidences_array[valid_mask]
             
             # If too many outliers removed, use all values
             if len(filtered_values) < 2:
                 filtered_values = pd_array
+                filtered_confidences = confidences_array
                 outliers_removed = 0
             else:
                 outliers_removed = len(pd_values) - len(filtered_values)
             
-            # Calculate final statistics
+            # IMPROVEMENT: Apply temporal filtering
+            if len(filtered_values) >= 3:
+                filtered_values, uncertainties = filter_pd_sequence(
+                    filtered_values.tolist(),
+                    filtered_confidences.tolist(),
+                    process_noise=0.1,
+                    measurement_noise=0.5
+                )
+                filtered_values = np.array(filtered_values)
+            
+            # IMPROVEMENT: Confidence-weighted averaging
+            weights = filtered_confidences ** 2  # Square to emphasize high confidence
+            weights = weights / np.sum(weights) if np.sum(weights) > 0 else np.ones_like(weights) / len(weights)
+            
+            weighted_mean_pd = float(np.sum(filtered_values * weights))
+            weighted_std_pd = float(np.sqrt(np.sum(weights * (filtered_values - weighted_mean_pd) ** 2)))
+            
+            # Also calculate simple statistics for comparison
             mean_pd = float(np.mean(filtered_values))
             std_pd = float(np.std(filtered_values))
             median_pd = float(np.median(filtered_values))
             
-            # Confidence based on frame count and consistency
+            # Use weighted mean as final result
+            final_pd = weighted_mean_pd
+            
+            # Confidence based on frame count, consistency, and weighted variance
             base_confidence = min(len(filtered_values) / 5, 1.0)  # Max confidence at 5+ frames
-            consistency_bonus = max(0, 1 - (std_pd / mean_pd) * 10) if mean_pd > 0 else 0  # Lower std = higher confidence
+            consistency_bonus = max(0, 1 - (weighted_std_pd / final_pd) * 10) if final_pd > 0 else 0
             final_confidence = 0.7 * base_confidence + 0.3 * consistency_bonus
             
             # Save summary result
@@ -537,24 +565,31 @@ class PDService:
                 f.write(f"\nIndividual values: {pd_values}\n")
                 f.write(f"Filtered values: {filtered_values.tolist()}\n")
             
-            print(f"[PDService] Multi-frame result: PD={mean_pd:.2f}mm, std={std_pd:.2f}mm, conf={final_confidence:.2f}")
+            print(f"[PDService] Multi-frame result: PD={final_pd:.2f}mm (weighted), std={weighted_std_pd:.2f}mm, conf={final_confidence:.2f}")
+            
+            # Clean up temporary attribute
+            if hasattr(self, '_pd_confidences'):
+                delattr(self, '_pd_confidences')
             
             return {
                 'success': True,
-                'pd_mm': round(mean_pd, 1),
+                'pd_mm': round(final_pd, 1),
                 'confidence': round(final_confidence, 2),
                 'error': None,
                 'debug_dir': debug_dir,
                 'details': {
-                    'method': 'multi_frame_average',
+                    'method': 'multi_frame_weighted_temporal',
                     'frames_total': len(images),
                     'frames_valid': len(pd_values),
                     'frames_used': len(filtered_values),
                     'outliers_removed': outliers_removed,
+                    'mean_pd': round(mean_pd, 2),
+                    'weighted_mean_pd': round(weighted_mean_pd, 2),
                     'std_mm': round(std_pd, 2),
+                    'weighted_std_mm': round(weighted_std_pd, 2),
                     'median_mm': round(median_pd, 1),
                     'individual_results': individual_results,
-                    'warnings': [] if std_pd < 1.0 else ['High variance between frames - measurement may be less accurate']
+                    'warnings': [] if weighted_std_pd < 1.0 else ['High variance between frames - measurement may be less accurate']
                 }
             }
             
