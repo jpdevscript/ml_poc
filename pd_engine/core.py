@@ -245,17 +245,12 @@ class PDMeasurement:
                     # Use 3D photogrammetric result
                     result.camera_distance_mm = photo_result.camera_distance_mm
                     result.pd_metric_mm = photo_result.pd_near_mm
-                    result.pd_depth_corrected_mm = photo_result.pd_far_mm
+                    result.pd_depth_corrected_mm = photo_result.pd_near_mm  # No far adjustment
                     
                     # Use NEAR PD as the final result (actual measured PD)
-                    # pd_far_mm includes +2mm for distance glasses which inflates the reading
+                    # The simple_pd_from_scale already uses horizontal pupil distance
+                    # which naturally corrects for head rotation, so no yaw correction needed
                     result.pd_final_mm = photo_result.pd_near_mm
-                    
-                    # Apply yaw correction if significant head turn (>3 degrees)
-                    if result.head_pose and abs(result.head_pose.yaw) > 3:
-                        yaw_factor = np.cos(np.radians(result.head_pose.yaw))
-                        result.pd_yaw_corrected_mm = result.pd_final_mm / yaw_factor
-                        result.pd_final_mm = result.pd_yaw_corrected_mm
                     
                     # High confidence for 3D method
                     result.confidence = 0.9 * iris_result.confidence
@@ -302,18 +297,23 @@ class PDMeasurement:
         result.camera_distance_mm = camera_distance
         
         # Step 3: Apply corrections (fallback path - simple scaling)
+        # IMPORTANT: Disable depth and vergence corrections as they inflate the PD
+        # These corrections assume specific camera/face geometry that may not be accurate
         correction_result = self.corrector.apply_corrections(
             raw_pd_px=result.raw_pd_px,
             scale_factor=scale_factor,
             camera_distance_mm=camera_distance,
-            head_pose=result.head_pose
+            head_pose=result.head_pose,
+            apply_yaw_correction=True,  # Keep yaw for significant head turns
+            apply_depth_correction=False,  # Disable - adds ~1mm
+            apply_vergence_correction=False  # Disable - adds ~1-2mm
         )
         
         # Store intermediate values
         result.pd_metric_mm = correction_result.pd_metric_mm
         result.pd_yaw_corrected_mm = correction_result.pd_yaw_corrected_mm
-        result.pd_depth_corrected_mm = correction_result.pd_depth_corrected_mm
-        result.pd_final_mm = correction_result.pd_final_mm
+        result.pd_depth_corrected_mm = correction_result.pd_metric_mm  # No depth correction
+        result.pd_final_mm = correction_result.pd_yaw_corrected_mm  # Use yaw-corrected only
         result.warnings.extend(correction_result.warnings)
         
         # Calculate combined confidence
