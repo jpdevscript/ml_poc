@@ -24,6 +24,11 @@ CARD_WIDTH_MM = 85.60
 CARD_HEIGHT_MM = 53.98
 CARD_ASPECT_RATIO = CARD_WIDTH_MM / CARD_HEIGHT_MM
 
+# Empirical calibration factor
+# The segmentation model slightly expands card boundaries, causing ~1.6% over-estimation
+# This factor was derived from calibration tests with known PD values
+PD_CALIBRATION_FACTOR = 0.984
+
 # Anthropometric constants - conservative values
 # The homography projection partially accounts for perspective, so use smaller offsets
 OFFSET_GLABELLA_TO_CORNEA = 5.0  # mm (conservative: 5-8mm typical)
@@ -742,12 +747,14 @@ def simple_pd_from_scale(
     # Use horizontal distance for PD
     pupil_dist_px = pupil_dx
     
-    # Raw PD in mm
-    pd_mm = pupil_dist_px * scale_factor
+    # Raw PD in mm with calibration factor
+    # The calibration factor corrects for segmentation expanding card boundaries slightly
+    pd_mm = pupil_dist_px * scale_factor * PD_CALIBRATION_FACTOR
     
     if debug:
         print(f"   Pupil: dx={pupil_dx:.1f}, dy={pupil_dy:.1f} px")
-        print(f"   PD: {pd_mm:.2f} mm")
+        print(f"   Raw PD: {pupil_dist_px * scale_factor:.2f} mm")
+        print(f"   Calibrated PD: {pd_mm:.2f} mm (×{PD_CALIBRATION_FACTOR})")
     
     # Estimate camera distance
     camera_distance = card_mm / scale_factor * 0.5  # Rough estimate
