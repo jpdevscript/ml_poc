@@ -12,6 +12,7 @@ from datetime import datetime
 import math
 
 from pd_engine.core import PDMeasurement
+from pd_engine.iris_pd_calculator import calculate_pd_from_iris, IrisPDResult
 
 
 class FaceDetector:
@@ -473,19 +474,74 @@ class PDService:
             print(f"[PDService] Multi-frame: {len(pd_values)}/{len(images)} valid frames in {elapsed:.2f}s")
             
             if len(pd_values) < 3:
-                # Need at least 3 valid frames for medical-grade measurement
-                return {
-                    'success': False,
-                    'pd_mm': None,
-                    'confidence': 0,
-                    'error': f'Only {len(pd_values)} valid frames detected. Need at least 3 for medical-grade.',
-                    'debug_dir': debug_dir,
-                    'details': {
-                        'frames_total': len(images),
-                        'frames_valid': len(pd_values),
-                        'individual_results': individual_results
+                # === FALLBACK: Try iris-based method ===
+                print(f"[PDService] Card method failed ({len(pd_values)} frames). Trying iris-based fallback...")
+                
+                iris_pd_values = []
+                iris_debug_images = []
+                
+                for i, image in enumerate(images):
+                    frame_debug_dir = os.path.join(debug_dir, f"iris_frame_{i}")
+                    os.makedirs(frame_debug_dir, exist_ok=True)
+                    
+                    try:
+                        iris_result = calculate_pd_from_iris(
+                            image, 
+                            debug_dir=frame_debug_dir,
+                            debug=False  # Disable verbose output
+                        )
+                        if iris_result.success:
+                            iris_pd_values.append(iris_result.pd_total_mm)
+                            # Save visualization
+                            viz_path = os.path.join(frame_debug_dir, "result.jpg")
+                            if os.path.exists(os.path.join(frame_debug_dir, "iris_02_result_nocard.jpg")):
+                                iris_debug_images.append(os.path.join(frame_debug_dir, "iris_02_result_nocard.jpg"))
+                    except Exception as e:
+                        print(f"[PDService] Iris fallback frame {i} error: {e}")
+                
+                if len(iris_pd_values) >= 3:
+                    # Use iris-based measurements
+                    iris_array = np.array(iris_pd_values)
+                    final_pd = float(np.median(iris_array))
+                    std_pd = float(np.std(iris_array))
+                    
+                    print(f"[PDService] Iris fallback success: PD={final_pd:.2f}mm from {len(iris_pd_values)} frames")
+                    
+                    return {
+                        'success': True,
+                        'pd_mm': round(final_pd, 1),
+                        'confidence': round(0.7, 2),  # Lower confidence for iris
+                        'error': None,
+                        'debug_dir': debug_dir,
+                        'method': 'iris',
+                        'debug_images': iris_debug_images[:3],  # Return first 3
+                        'details': {
+                            'method': 'iris_fallback',
+                            'frames_total': len(images),
+                            'frames_valid': len(iris_pd_values),
+                            'std_mm': round(std_pd, 2),
+                            'median_mm': round(final_pd, 2),
+                            'warnings': ['Card not detected - using iris-based measurement'],
+                            'individual_results': individual_results
+                        }
                     }
-                }
+                else:
+                    # Both methods failed
+                    return {
+                        'success': False,
+                        'pd_mm': None,
+                        'confidence': 0,
+                        'error': f'Could not measure PD with card ({len(pd_values)} frames) or iris ({len(iris_pd_values)} frames) methods.',
+                        'debug_dir': debug_dir,
+                        'method': 'none',
+                        'debug_images': [],
+                        'details': {
+                            'frames_total': len(images),
+                            'frames_valid_card': len(pd_values),
+                            'frames_valid_iris': len(iris_pd_values),
+                            'individual_results': individual_results
+                        }
+                    }
             
             # === WEIGHTED MEDIAN FILTER (Medical-Grade) ===
             # Weight by confidence: higher confidence = more weight
@@ -568,12 +624,21 @@ class PDService:
             
             print(f"[PDService] Medical-grade result: PD={final_pd:.2f}mm, std={std_pd:.2f}mm, conf={final_confidence:.2f}")
             
+            # Collect debug images for card method
+            card_debug_images = []
+            for i in range(min(3, len(images))):
+                result_path = os.path.join(debug_dir, f"frame_{i}", "result_visualization.jpg")
+                if os.path.exists(result_path):
+                    card_debug_images.append(result_path)
+            
             return {
                 'success': True,
                 'pd_mm': round(final_pd, 1),  # Use weighted median
                 'confidence': round(final_confidence, 2),
                 'error': None,
                 'debug_dir': debug_dir,
+                'method': 'card',
+                'debug_images': card_debug_images,
                 'details': {
                     'method': 'medical_grade_weighted_median',
                     'frames_total': len(images),
