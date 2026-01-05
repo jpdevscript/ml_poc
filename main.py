@@ -39,6 +39,11 @@ inputs_dir = 'inputs'
 os.makedirs(inputs_dir, exist_ok=True)
 app.mount("/debug-images", StaticFiles(directory=inputs_dir), name="debug-images")
 
+# Also serve debug directory (where PD measurement debug images are saved)
+debug_dir = 'debug'
+os.makedirs(debug_dir, exist_ok=True)
+app.mount("/debug", StaticFiles(directory=debug_dir), name="debug")
+
 
 class Base64ImageRequest(BaseModel):
     """Request with base64 encoded image."""
