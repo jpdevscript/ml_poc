@@ -429,9 +429,10 @@ class PDService:
                     yaw = face_result.get('yaw', 0)
                     pitch = face_result.get('pitch', 0)
                     
-                    # Relaxed thresholds - 15 degrees allows for natural head movement
-                    MAX_YAW = 15.0  # degrees
-                    MAX_PITCH = 15.0  # degrees
+                    # Medical-grade threshold: 5 degrees for accurate measurements
+                    # Beyond this, geometric foreshortening becomes uncorrectable
+                    MAX_YAW = 5.0  # degrees
+                    MAX_PITCH = 5.0  # degrees
                     
                     if abs(yaw) > MAX_YAW or abs(pitch) > MAX_PITCH:
                         print(f"[PDService] Frame {i} rejected: pose out of range (yaw={yaw:.1f}, pitch={pitch:.1f})")
@@ -471,13 +472,13 @@ class PDService:
             elapsed = time.time() - start_time
             print(f"[PDService] Multi-frame: {len(pd_values)}/{len(images)} valid frames in {elapsed:.2f}s")
             
-            if len(pd_values) < 2:
-                # Not enough valid frames
+            if len(pd_values) < 3:
+                # Need at least 3 valid frames for medical-grade measurement
                 return {
                     'success': False,
                     'pd_mm': None,
                     'confidence': 0,
-                    'error': f'Only {len(pd_values)} valid frames detected. Need at least 2.',
+                    'error': f'Only {len(pd_values)} valid frames detected. Need at least 3 for medical-grade.',
                     'debug_dir': debug_dir,
                     'details': {
                         'frames_total': len(images),
@@ -486,73 +487,103 @@ class PDService:
                     }
                 }
             
-            # Statistical averaging with IQR outlier rejection
+            # === WEIGHTED MEDIAN FILTER (Medical-Grade) ===
+            # Weight by confidence: higher confidence = more weight
             pd_array = np.array(pd_values)
             
-            # Calculate IQR bounds
+            # Get confidence weights from individual results
+            weights = []
+            for res in individual_results:
+                if res.get('valid', False):
+                    w = res.get('confidence', 0.5)
+                    # Also boost weight for lower blur scores
+                    blur_score = res.get('blur_score', 50)
+                    blur_weight = min(blur_score / 100, 1.0)  # Higher blur score = sharper = more weight
+                    weights.append(w * (0.7 + 0.3 * blur_weight))
+            
+            weights = np.array(weights)
+            if len(weights) == 0 or weights.sum() == 0:
+                weights = np.ones(len(pd_array))
+            
+            # Weighted median calculation
+            def weighted_median(values, weights):
+                """Calculate weighted median."""
+                sorted_indices = np.argsort(values)
+                sorted_values = values[sorted_indices]
+                sorted_weights = weights[sorted_indices]
+                cumulative_weight = np.cumsum(sorted_weights)
+                median_idx = np.searchsorted(cumulative_weight, cumulative_weight[-1] / 2)
+                return sorted_values[min(median_idx, len(sorted_values) - 1)]
+            
+            # Calculate IQR for outlier detection
             q1 = np.percentile(pd_array, 25)
             q3 = np.percentile(pd_array, 75)
             iqr = q3 - q1
             
-            # For small sample sizes, use a tighter multiplier
-            multiplier = 1.5 if len(pd_values) >= 5 else 2.0
-            lower_bound = q1 - multiplier * iqr
-            upper_bound = q3 + multiplier * iqr
+            # Conservative outlier bounds
+            lower_bound = q1 - 1.5 * iqr
+            upper_bound = q3 + 1.5 * iqr
             
             # Filter outliers
             valid_mask = (pd_array >= lower_bound) & (pd_array <= upper_bound)
             filtered_values = pd_array[valid_mask]
+            filtered_weights = weights[valid_mask]
             
             # If too many outliers removed, use all values
             if len(filtered_values) < 2:
                 filtered_values = pd_array
+                filtered_weights = weights
                 outliers_removed = 0
             else:
                 outliers_removed = len(pd_values) - len(filtered_values)
             
-            # Calculate final statistics
-            mean_pd = float(np.mean(filtered_values))
-            std_pd = float(np.std(filtered_values))
+            # Calculate final statistics using weighted median
+            final_pd = weighted_median(filtered_values, filtered_weights)
+            mean_pd = float(np.average(filtered_values, weights=filtered_weights))
+            std_pd = float(np.sqrt(np.average((filtered_values - mean_pd)**2, weights=filtered_weights)))
             median_pd = float(np.median(filtered_values))
             
             # Confidence based on frame count and consistency
             base_confidence = min(len(filtered_values) / 5, 1.0)  # Max confidence at 5+ frames
-            consistency_bonus = max(0, 1 - (std_pd / mean_pd) * 10) if mean_pd > 0 else 0  # Lower std = higher confidence
+            consistency_bonus = max(0, 1 - (std_pd / mean_pd) * 10) if mean_pd > 0 else 0
             final_confidence = 0.7 * base_confidence + 0.3 * consistency_bonus
             
             # Save summary result
             summary_path = os.path.join(debug_dir, "summary.txt")
             with open(summary_path, 'w') as f:
-                f.write(f"Multi-frame PD Measurement Summary\n")
-                f.write(f"==================================\n")
+                f.write(f"Multi-frame PD Measurement Summary (Medical-Grade)\n")
+                f.write(f"=================================================\n")
                 f.write(f"Total frames: {len(images)}\n")
                 f.write(f"Valid frames: {len(pd_values)}\n")
                 f.write(f"Frames after outlier removal: {len(filtered_values)}\n")
                 f.write(f"Outliers removed: {outliers_removed}\n")
                 f.write(f"\nStatistics:\n")
-                f.write(f"  Mean PD: {mean_pd:.2f} mm\n")
-                f.write(f"  Median PD: {median_pd:.2f} mm\n")
-                f.write(f"  Std Dev: {std_pd:.2f} mm\n")
+                f.write(f"  Weighted Median PD: {final_pd:.2f} mm\n")
+                f.write(f"  Weighted Mean PD: {mean_pd:.2f} mm\n")
+                f.write(f"  Simple Median PD: {median_pd:.2f} mm\n")
+                f.write(f"  Weighted Std Dev: {std_pd:.2f} mm\n")
                 f.write(f"  Confidence: {final_confidence:.2f}\n")
                 f.write(f"\nIndividual values: {pd_values}\n")
                 f.write(f"Filtered values: {filtered_values.tolist()}\n")
             
-            print(f"[PDService] Multi-frame result: PD={mean_pd:.2f}mm, std={std_pd:.2f}mm, conf={final_confidence:.2f}")
+            print(f"[PDService] Medical-grade result: PD={final_pd:.2f}mm, std={std_pd:.2f}mm, conf={final_confidence:.2f}")
             
             return {
                 'success': True,
-                'pd_mm': round(mean_pd, 1),
+                'pd_mm': round(final_pd, 1),  # Use weighted median
                 'confidence': round(final_confidence, 2),
                 'error': None,
                 'debug_dir': debug_dir,
                 'details': {
-                    'method': 'multi_frame_average',
+                    'method': 'medical_grade_weighted_median',
                     'frames_total': len(images),
                     'frames_valid': len(pd_values),
                     'frames_used': len(filtered_values),
                     'outliers_removed': outliers_removed,
                     'std_mm': round(std_pd, 2),
-                    'median_mm': round(median_pd, 1),
+                    'weighted_median_mm': round(final_pd, 2),
+                    'weighted_mean_mm': round(mean_pd, 2),
+                    'simple_median_mm': round(median_pd, 2),
                     'individual_results': individual_results,
                     'warnings': [] if std_pd < 1.0 else ['High variance between frames - measurement may be less accurate']
                 }
