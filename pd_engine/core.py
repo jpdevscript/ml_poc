@@ -53,6 +53,10 @@ class PDResult:
     pd_yaw_corrected_mm: Optional[float] = None
     pd_depth_corrected_mm: Optional[float] = None
     
+    # Monocular PD values (medical-grade)
+    pd_left_mm: Optional[float] = None   # Left pupil to nose
+    pd_right_mm: Optional[float] = None  # Right pupil to nose
+    
     # Final result
     pd_final_mm: Optional[float] = None
     
@@ -229,7 +233,7 @@ class PDMeasurement:
                 result.scale_factor_mm_per_px = card_result.scale_factor
                 result.calibration_method = "card_3d"
                 
-                # Use 3D photogrammetric calculation
+                # Use 3D photogrammetric calculation with medical-grade algorithm
                 photo_result = calculate_precise_pd(
                     card_corners=card_result.corners,
                     pupil_left_px=result.left_iris_px,
@@ -237,19 +241,23 @@ class PDMeasurement:
                     image_shape=frame.shape[:2],
                     image=frame,
                     head_pose=result.head_pose,
+                    iris_diameter_px=iris_result.iris_diameter_px,
                     debug_dir=debug_dir,
                     debug=bool(debug_dir)
                 )
                 
                 if photo_result.success:
-                    # Use 3D photogrammetric result
+                    # Use medical-grade photogrammetric result
                     result.camera_distance_mm = photo_result.camera_distance_mm
                     result.pd_metric_mm = photo_result.pd_near_mm
-                    result.pd_depth_corrected_mm = photo_result.pd_near_mm  # No far adjustment
+                    result.pd_depth_corrected_mm = photo_result.pd_near_mm
                     
-                    # Use NEAR PD as the final result (actual measured PD)
-                    # The simple_pd_from_scale already uses horizontal pupil distance
-                    # which naturally corrects for head rotation, so no yaw correction needed
+                    # Store monocular values if available
+                    if photo_result.validation_info:
+                        result.pd_left_mm = photo_result.validation_info.get('pd_left_mm')
+                        result.pd_right_mm = photo_result.validation_info.get('pd_right_mm')
+                    
+                    # Use near PD as the final result
                     result.pd_final_mm = photo_result.pd_near_mm
                     
                     # High confidence for 3D method
