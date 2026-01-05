@@ -249,6 +249,132 @@ def print_summary(debug_dir: str) -> None:
         print(f"    - {f} ({size}KB)")
 
 
+def test_pd_no_card(
+    image_path: str,
+    debug_dir: str
+) -> None:
+    """
+    Test no-card PD measurement using iris diameter as reference.
+    
+    This method uses the human iris diameter constant (11.7mm) instead
+    of a physical reference card. More accurate because iris and pupils
+    are co-planar (no vertex distance error).
+    
+    Args:
+        image_path: Path to input image
+        debug_dir: Directory to save debug images
+    """
+    from pd_engine.iris_pd_calculator import calculate_pd_from_iris, IrisPDResult
+    from pd_engine.measurement import IrisMeasurer
+    
+    print_header("NO-CARD PD MEASUREMENT (Iris Reference)")
+    
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"Error: Could not load image: {image_path}")
+        return
+    
+    h, w = image.shape[:2]
+    print(f"Image: {image_path}")
+    print(f"Size: {w}x{h}")
+    print(f"Debug: {debug_dir}")
+    print(f"Method: Iris Diameter Constant (11.7mm)")
+    
+    # Save input
+    cv2.imwrite(os.path.join(debug_dir, "00_input.jpg"), image)
+    
+    # Quality gates first
+    print_section("QUALITY GATES")
+    
+    # Blur check
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    is_sharp = blur_score > 30
+    print(f"  Blur Score: {blur_score:.1f} (threshold=30)")
+    print(f"  Sharpness: {'✓ PASS' if is_sharp else '✗ FAIL'}")
+    
+    if not is_sharp:
+        print("\n  ✗ Image too blurry for accurate measurement")
+        return
+    
+    # Head pose check using IrisMeasurer
+    iris_measurer = IrisMeasurer()
+    try:
+        iris_result = iris_measurer.measure(image)
+        if iris_result.detected and iris_result.head_pose:
+            yaw = abs(iris_result.head_pose.yaw)
+            pitch = abs(iris_result.head_pose.pitch)
+            print(f"  Head Pose: yaw={iris_result.head_pose.yaw:.1f}°, pitch={iris_result.head_pose.pitch:.1f}°")
+            
+            if yaw > 5 or pitch > 5:
+                print(f"    ⚠ Pose outside optimal range (±5°)")
+            else:
+                print(f"    ✓ Pose OK")
+        else:
+            print("  Head Pose: Could not detect")
+    finally:
+        iris_measurer.close()
+    
+    # Run no-card PD measurement
+    print_section("IRIS-BASED PD MEASUREMENT")
+    
+    result = calculate_pd_from_iris(
+        image,
+        debug_dir=debug_dir,
+        debug=True
+    )
+    
+    print_section("RESULT")
+    
+    if result.success:
+        print(f"  ✓ PD: {result.pd_total_mm:.2f} mm")
+        print(f"    Method: No-Card (Iris Reference)")
+        print(f"    Left PD: {result.pd_left_mm:.2f} mm")
+        print(f"    Right PD: {result.pd_right_mm:.2f} mm")
+        print(f"    Left Iris: {result.left_iris_width_px:.1f} px")
+        print(f"    Right Iris: {result.right_iris_width_px:.1f} px")
+        print(f"    Scale Factor: {result.scale_factor:.4f} mm/px")
+        print(f"    Confidence: {result.confidence:.1%}")
+        
+        if result.warnings:
+            for w in result.warnings:
+                print(f"    Warning: {w}")
+        
+        # Save final visualization
+        viz = image.copy()
+        if result.left_pupil_px and result.right_pupil_px:
+            # Draw pupil centers
+            cv2.circle(viz, (int(result.left_pupil_px[0]), int(result.left_pupil_px[1])), 
+                      6, (0, 255, 0), 2)
+            cv2.circle(viz, (int(result.right_pupil_px[0]), int(result.right_pupil_px[1])), 
+                      6, (0, 255, 0), 2)
+            # Draw PD line
+            cv2.line(viz, 
+                    (int(result.left_pupil_px[0]), int(result.left_pupil_px[1])),
+                    (int(result.right_pupil_px[0]), int(result.right_pupil_px[1])),
+                    (0, 255, 255), 2)
+            # Draw nose bridge
+            if result.nose_bridge_px:
+                cv2.circle(viz, (int(result.nose_bridge_px[0]), int(result.nose_bridge_px[1])), 
+                          4, (255, 0, 0), -1)
+        
+        # Add text overlay
+        cv2.putText(viz, f"PD: {result.pd_total_mm:.2f}mm (No-Card Method)", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(viz, f"L: {result.pd_left_mm:.2f}mm | R: {result.pd_right_mm:.2f}mm",
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(viz, f"Iris: {result.avg_iris_width_px:.1f}px | Scale: {result.scale_factor:.4f}",
+                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        viz_path = os.path.join(debug_dir, "result_visualization_nocard.jpg")
+        cv2.imwrite(viz_path, viz)
+        print(f"\n    → Visualization: {viz_path}")
+        
+    else:
+        print(f"  ✗ PD Measurement FAILED")
+        print(f"    Error: {result.error_message}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Test PD measurement on images",
@@ -260,6 +386,8 @@ def main() -> None:
                         help="Base directory for debug output")
     parser.add_argument("--card-only", action="store_true",
                         help="Only test card detection")
+    parser.add_argument("--no-card", action="store_true",
+                        help="Use iris-based PD measurement (no reference card)")
     parser.add_argument("--no-forehead", action="store_true",
                         help="Disable forehead ROI detection")
     
@@ -273,14 +401,24 @@ def main() -> None:
     # Create debug directory
     debug_dir = create_debug_dir(args.output_dir)
     
+    # Determine mode
+    if args.no_card:
+        mode = "No-Card (Iris Reference)"
+    elif args.card_only:
+        mode = "Card Detection Only"
+    else:
+        mode = "Full PD Measurement"
+    
     print_header("PD MEASUREMENT DEMO")
     print(f"  Input: {args.image_path}")
     print(f"  Output: {debug_dir}")
-    print(f"  Mode: {'Card Detection Only' if args.card_only else 'Full PD Measurement'}")
+    print(f"  Mode: {mode}")
     
     use_forehead = not args.no_forehead
     
-    if args.card_only:
+    if args.no_card:
+        test_pd_no_card(args.image_path, debug_dir)
+    elif args.card_only:
         test_card_detection(args.image_path, debug_dir, use_forehead)
     else:
         test_full_pd(args.image_path, debug_dir, use_forehead)
@@ -291,3 +429,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
