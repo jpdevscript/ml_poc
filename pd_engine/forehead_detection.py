@@ -197,8 +197,8 @@ class ForeheadDetector:
         # Bottom: include glabella area plus some margin below (card may rest on brow ridge)
         roi_y2 = glabella[1] + int(face_height * 0.25)  # 25% below glabella (more generous)
         
-        # Top: extend upward for full card + margin (card may extend above head in image)
-        roi_y1 = glabella[1] - int(card_height_estimate * 2.5)  # 2.5x card height above glabella
+        # Top: extend upward for card + small margin (card height is roughly equal to distance from glabella)
+        roi_y1 = glabella[1] - int(card_height_estimate * 1.3)  # 1.3x card height above glabella
         
         # Clamp to image bounds
         roi_x1 = max(0, roi_x1)
