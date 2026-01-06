@@ -676,10 +676,79 @@ class PDService:
             std_pd = float(np.sqrt(np.average((filtered_values - mean_pd)**2, weights=filtered_weights)))
             median_pd = float(np.median(filtered_values))
             
+            # === PD RANGE VALIDATION ===
+            # Normal adult PD range: 50-80mm
+            # If card method gives result outside this range, fall back to iris method
+            MIN_NORMAL_PD_MM = 55
+            MAX_NORMAL_PD_MM = 75
+            
+            if final_pd < MIN_NORMAL_PD_MM or final_pd > MAX_NORMAL_PD_MM:
+                print(f"[PDService] Card PD {final_pd:.2f}mm outside normal range ({MIN_NORMAL_PD_MM}-{MAX_NORMAL_PD_MM}mm)")
+                print(f"[PDService] Triggering iris fallback for more accurate measurement...")
+                
+                # Try iris-based fallback
+                iris_pd_values = []
+                iris_debug_images = []
+                
+                for i, image in enumerate(images):
+                    frame_debug_dir = os.path.join(debug_dir, f"frame_{i:02d}")
+                    try:
+                        iris_result = calculate_pd_from_iris(
+                            image,
+                            debug=True,
+                            debug_dir=frame_debug_dir
+                        )
+                        if iris_result.success:
+                            iris_pd_values.append(iris_result.pd_total_mm)
+                            viz_path = os.path.join(frame_debug_dir, "iris_02_result_nocard.jpg")
+                            if os.path.exists(viz_path):
+                                iris_debug_images.append(viz_path)
+                    except Exception as e:
+                        print(f"[PDService] Iris fallback frame {i} error: {e}")
+                
+                if len(iris_pd_values) >= 3:
+                    iris_array = np.array(iris_pd_values)
+                    iris_final_pd = float(np.median(iris_array))
+                    iris_std_pd = float(np.std(iris_array))
+                    
+                    # Check if iris result is within normal range
+                    if MIN_NORMAL_PD_MM <= iris_final_pd <= MAX_NORMAL_PD_MM:
+                        print(f"[PDService] Iris fallback success: PD={iris_final_pd:.2f}mm (replacing card result)")
+                        return {
+                            'success': True,
+                            'pd_mm': round(iris_final_pd, 1),
+                            'confidence': round(0.75, 2),
+                            'error': None,
+                            'debug_dir': debug_dir,
+                            'method': 'iris',
+                            'debug_images': iris_debug_images[:3],
+                            'details': {
+                                'method': 'iris_range_fallback',
+                                'frames_total': len(images),
+                                'frames_valid': len(iris_pd_values),
+                                'std_mm': round(iris_std_pd, 2),
+                                'median_mm': round(iris_final_pd, 2),
+                                'card_pd_mm': round(final_pd, 2),
+                                'warnings': [f'Card method gave {final_pd:.1f}mm (outside {MIN_NORMAL_PD_MM}-{MAX_NORMAL_PD_MM}mm range) - using iris method'],
+                                'individual_results': individual_results
+                            }
+                        }
+                    else:
+                        print(f"[PDService] Iris fallback also outside range: {iris_final_pd:.2f}mm")
+                
+                # If iris fallback also failed/out of range, continue with card result but add warning
+                print(f"[PDService] Using card result with warning (PD={final_pd:.2f}mm)")
+            
             # Confidence based on frame count and consistency
             base_confidence = min(len(filtered_values) / 5, 1.0)  # Max confidence at 5+ frames
             consistency_bonus = max(0, 1 - (std_pd / mean_pd) * 10) if mean_pd > 0 else 0
             final_confidence = 0.7 * base_confidence + 0.3 * consistency_bonus
+            
+            # Add warning if PD was outside normal range but we're using it anyway
+            pd_warnings = []
+            if final_pd < MIN_NORMAL_PD_MM or final_pd > MAX_NORMAL_PD_MM:
+                pd_warnings.append(f'PD {final_pd:.1f}mm is outside typical adult range ({MIN_NORMAL_PD_MM}-{MAX_NORMAL_PD_MM}mm)')
+                final_confidence *= 0.7  # Reduce confidence
             
             # Save summary result
             summary_path = os.path.join(debug_dir, "summary.txt")
