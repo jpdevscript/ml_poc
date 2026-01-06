@@ -23,22 +23,40 @@ class FaceDetector:
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         )
         
-        # Initialize MediaPipe Face Mesh for head pose
+        # Initialize MediaPipe Face Landmarker (Tasks API)
         try:
             import mediapipe as mp
-            self.mp_face_mesh = mp.solutions.face_mesh
-            self.face_mesh = self.mp_face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=1,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5
+            import os
+            
+            model_path = os.path.join(
+                os.path.dirname(__file__),
+                "face_landmarker.task"
             )
-            self.use_mediapipe = True
-            print("[FaceDetector] MediaPipe Face Mesh initialized for head pose")
+            
+            if not os.path.exists(model_path):
+                print(f"[FaceDetector] Model not found at: {model_path}")
+                self.use_mediapipe = False
+                self.face_landmarker = None
+            else:
+                base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+                options = mp.tasks.vision.FaceLandmarkerOptions(
+                    base_options=base_options,
+                    running_mode=mp.tasks.vision.RunningMode.IMAGE,
+                    num_faces=1,
+                    min_face_detection_confidence=0.5,
+                    min_face_presence_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    output_face_blendshapes=False,
+                    output_facial_transformation_matrixes=False
+                )
+                self.face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+                self.use_mediapipe = True
+                self.mp = mp  # Store mp module reference
+                print("[FaceDetector] MediaPipe FaceLandmarker initialized for head pose")
         except Exception as e:
             print(f"[FaceDetector] MediaPipe not available: {e}")
             self.use_mediapipe = False
-            self.face_mesh = None
+            self.face_landmarker = None
     
     def _check_blur(self, image: np.ndarray, face_rect: Optional[Tuple[int, int, int, int]] = None) -> Tuple[bool, float]:
         """
@@ -72,28 +90,31 @@ class FaceDetector:
         Estimate head pose (yaw, pitch, roll) using MediaPipe face landmarks.
         Returns (yaw, pitch, roll) in degrees, or (None, None, None) if detection fails.
         """
-        if not self.use_mediapipe or self.face_mesh is None:
+        if not self.use_mediapipe or self.face_landmarker is None:
             return None, None, None
         
         try:
             h, w = image.shape[:2]
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            results = self.face_mesh.process(rgb_image)
             
-            if not results.multi_face_landmarks:
+            # Use Tasks API
+            mp_image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb_image)
+            results = self.face_landmarker.detect(mp_image)
+            
+            if not results.face_landmarks:
                 return None, None, None
             
-            landmarks = results.multi_face_landmarks[0]
+            landmarks = results.face_landmarks[0]
             
             # Key landmarks for pose estimation
             # Nose tip (1), Chin (152), Left eye outer (33), Right eye outer (263), 
             # Left mouth corner (61), Right mouth corner (291)
-            nose_tip = landmarks.landmark[1]
-            chin = landmarks.landmark[152]
-            left_eye = landmarks.landmark[33]
-            right_eye = landmarks.landmark[263]
-            left_mouth = landmarks.landmark[61]
-            right_mouth = landmarks.landmark[291]
+            nose_tip = landmarks[1]
+            chin = landmarks[152]
+            left_eye = landmarks[33]
+            right_eye = landmarks[263]
+            left_mouth = landmarks[61]
+            right_mouth = landmarks[291]
             
             # 3D model points (normalized face)
             model_points = np.array([
@@ -432,8 +453,8 @@ class PDService:
                     
                     # Medical-grade threshold: 5 degrees for accurate measurements
                     # Beyond this, geometric foreshortening becomes uncorrectable
-                    MAX_YAW = 5.0  # degrees
-                    MAX_PITCH = 5.0  # degrees
+                    MAX_YAW = 4.0  # degrees - slightly tighter for better accuracy
+                    MAX_PITCH = 4.0  # degrees
                     
                     if abs(yaw) > MAX_YAW or abs(pitch) > MAX_PITCH:
                         print(f"[PDService] Frame {i} rejected: pose out of range (yaw={yaw:.1f}, pitch={pitch:.1f})")
@@ -451,22 +472,78 @@ class PDService:
                 # Process frame with debug enabled for this frame
                 try:
                     result = self.pd_engine.process_frame(image, debug_dir=frame_debug_dir)
+                    
+                    # === CARD QUALITY VALIDATION ===
+                    # Check if card detection is reliable using aspect ratio
+                    card_valid = True
+                    rejection_reason = None
+                    
+                    if result.is_valid and result.card_width_px:
+                        # Credit card aspect ratio: 85.6mm / 53.98mm = 1.586
+                        # Allow ±15% margin for perspective distortion
+                        EXPECTED_ASPECT_RATIO = 1.586
+                        ASPECT_MARGIN = 0.15  # 15% tolerance
+                        
+                        # Calculate detected aspect ratio from card dimensions
+                        # card_width_px is available, we can derive height from scale factor
+                        # If scale_factor = 85.6mm / card_width_px, then:
+                        # card_height_px = 53.98mm / scale_factor
+                        if result.scale_factor_mm_per_px:
+                            card_width_mm = 85.6  # ISO ID-1 card
+                            card_height_mm = 53.98
+                            
+                            detected_width_px = result.card_width_px
+                            expected_height_px = card_height_mm / result.scale_factor_mm_per_px
+                            
+                            # Calculate aspect ratio from detected width and expected height
+                            detected_aspect = detected_width_px / expected_height_px if expected_height_px > 0 else 0
+                            
+                            # Check if aspect ratio is within tolerance
+                            aspect_error = abs(detected_aspect - EXPECTED_ASPECT_RATIO) / EXPECTED_ASPECT_RATIO
+                            
+                            if aspect_error > ASPECT_MARGIN:
+                                card_valid = False
+                                rejection_reason = f'aspect ratio error ({aspect_error:.1%} > {ASPECT_MARGIN:.0%}, detected={detected_aspect:.2f})'
+                                print(f"[PDService] Frame {i} rejected: {rejection_reason}")
+                        
+                        # Check 2: Camera distance validation (from iris diameter)
+                        # Eye guides on frontend are set for ~350-550mm distance
+                        if card_valid and result.camera_distance_mm:
+                            MIN_DISTANCE_MM = 300  # Too close
+                            MAX_DISTANCE_MM = 600  # Too far
+                            distance = result.camera_distance_mm
+                            
+                            if distance < MIN_DISTANCE_MM:
+                                card_valid = False
+                                rejection_reason = f'too close ({distance:.0f}mm < {MIN_DISTANCE_MM}mm)'
+                                print(f"[PDService] Frame {i} rejected: {rejection_reason}")
+                            elif distance > MAX_DISTANCE_MM:
+                                card_valid = False
+                                rejection_reason = f'too far ({distance:.0f}mm > {MAX_DISTANCE_MM}mm)'
+                                print(f"[PDService] Frame {i} rejected: {rejection_reason}")
+                    
                     frame_result = {
                         'frame': i,
-                        'valid': result.is_valid,
+                        'valid': result.is_valid and card_valid,
                         'pd_mm': round(result.pd_final_mm, 2) if result.is_valid else None,
                         'confidence': round(result.confidence, 2) if result.is_valid else 0,
-                        'blur_score': round(blur_score, 1)
+                        'blur_score': round(blur_score, 1),
+                        'scale_factor': round(result.scale_factor_mm_per_px, 4) if result.scale_factor_mm_per_px else None,
+                        'camera_distance_mm': round(result.camera_distance_mm) if result.camera_distance_mm else None,
+                        'rejection_reason': rejection_reason
                     }
-                    if result.is_valid:
+                    
+                    if result.is_valid and card_valid:
                         pd_values.append(result.pd_final_mm)
+                        print(f"[PDService] Frame {i} accepted: PD={result.pd_final_mm:.2f}mm, scale={result.scale_factor_mm_per_px:.3f}, dist={result.camera_distance_mm:.0f}mm")
                 except Exception as e:
                     print(f"[PDService] Frame {i} error: {e}")
                     frame_result = {
                         'frame': i,
                         'valid': False,
                         'pd_mm': None,
-                        'confidence': 0
+                        'confidence': 0,
+                        'rejection_reason': str(e)
                     }
                 individual_results.append(frame_result)
             

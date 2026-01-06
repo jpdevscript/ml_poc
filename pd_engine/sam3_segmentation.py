@@ -6,6 +6,7 @@ card segmentation on forehead images. Prompts are optimized for detecting
 rectangular cards held on the forehead.
 """
 
+from rich.themes import DEFAULT
 import base64
 import os
 from dataclasses import dataclass
@@ -37,11 +38,26 @@ class SAM3Segmenter:
     """
     
     # Default prompts for card detection
+    # DEFAULT_PROMPTS: List[str] = [
+    #     "rectangular card held by hand",
+    #     "flat rectangular object on forehead",
+    #     "thin card-like object forehead",
+    #     "identification document hand forehead"
+    # ]
+
     DEFAULT_PROMPTS: List[str] = [
         "rectangular card held by hand",
         "flat rectangular object on forehead",
         "thin card-like object forehead",
-        "identification document hand forehead"
+        "identification document hand forehead",
+        "thin rectangular plastic card in hand",
+        "flat credit card against forehead skin",
+        "rectangular payment card held by fingers",
+        "thin ID card pressed on forehead",
+        "credit/debit card on person's forehead",
+        "rectangular card object touching skin",
+        "handheld thin rectangular document",
+        "forehead-placed flat plastic rectangle"
     ]
     
     def __init__(

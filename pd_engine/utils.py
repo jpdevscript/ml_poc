@@ -27,7 +27,7 @@ RIGHT_IRIS_CENTER = 473
 # Thresholds
 ASPECT_RATIO_TOLERANCE = 0.25  # Tolerance for card aspect ratio (1.586 ± 0.25)
 MIN_CARD_AREA_RATIO = 0.01  # Card must be at least 1% of ROI area
-MAX_YAW_DEGREES = 5.0  # Warning threshold for head rotation
+MAX_YAW_DEGREES = 4.0  # Warning threshold for head rotation (tightened for accuracy)
 
 
 def euclidean_distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
