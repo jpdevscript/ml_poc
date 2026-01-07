@@ -219,13 +219,16 @@ def test_full_pd(
         
         # Calculate iris-based PD
         if iris_result.iris_diameter_px and iris_result.iris_diameter_px > 0:
-            CALIBRATED_IRIS_MM = 12.66
+            # Calibrated for 63.5mm target PD
+            CALIBRATED_IRIS_MM = 12.75
             scale_factor = CALIBRATED_IRIS_MM / iris_result.iris_diameter_px
             pd_iris = iris_result.raw_pd_px * scale_factor
         
         # Calculate inter-eye based PD
         if iris_result.inter_eye_distance_px and iris_result.inter_eye_distance_px > 0:
-            CALIBRATED_CONSTANT = 91.8
+            # Balanced constant for general use (avg of 88.8 for 63.5mm and 91.5 for 66.5mm)
+            # Expected error: ±1.5mm for most people
+            CALIBRATED_CONSTANT = 90.0
             pd_to_intereye_ratio = iris_result.raw_pd_px / iris_result.inter_eye_distance_px
             pd_intereye = pd_to_intereye_ratio * CALIBRATED_CONSTANT
         

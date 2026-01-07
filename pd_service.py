@@ -454,69 +454,36 @@ class PDService:
                 # Process frame with debug enabled for this frame
                 try:
                     if use_iris_only:
-                        # Iris-only mode: use IrisMeasurer with pinhole camera model
-                        from pd_engine.measurement import IrisMeasurer
-                        measurer = IrisMeasurer()
-                        iris_result = measurer.measure(image)
+                        # Use proper IrisPDEngine with complete 6-stage algorithm
+                        from pd_engine.iris_pd_engine import IrisPDEngine
                         
-                        if iris_result.detected and iris_result.raw_pd_px and iris_result.iris_diameter_px:
-                            # ========================================
-                            # PINHOLE CAMERA MODEL PD CALCULATION
-                            # ========================================
-                            # Step 1: Estimate focal length (approximate from image width)
-                            h, w = image.shape[:2]
-                            focal_length_px = w  # Common approximation for webcams
-                            
-                            # Step 2: Estimate depth using iris diameter constant
-                            # MediaPipe landmarks measure larger than true iris (11.7mm)
-                            # Calibrated: 11.7mm × 1.154 = 13.5mm (from live testing 55mm → 63.5mm)
-                            IRIS_DIAMETER_MM = 13.5
-                            depth_mm = (IRIS_DIAMETER_MM * focal_length_px) / iris_result.iris_diameter_px
-                            
-                            # Step 3: Calculate PD using pinhole camera model
-                            # PD_mm = (pixel_distance × depth_mm) / focal_length_px
-                            pd_mm = (iris_result.raw_pd_px * depth_mm) / focal_length_px
-                            
-                            # This simplifies to: pd_mm = raw_pd_px * 11.7 / iris_diameter_px
-                            # But using explicit steps for clarity and potential focal calibration
-                            
-                            # Step 4: Apply yaw correction if needed
-                            if iris_result.head_pose and abs(iris_result.head_pose.yaw) > 2:
-                                import math
-                                yaw_rad = math.radians(min(abs(iris_result.head_pose.yaw), 45))
-                                yaw_correction = 1.0 / math.cos(yaw_rad)
-                                pd_mm = pd_mm * yaw_correction
-                            
-                            # Step 5: Confidence scoring
-                            confidence = 0.8  # Base confidence for iris method
-                            
-                            # Reduce confidence for extreme depths (too close/far)
-                            if depth_mm < 200 or depth_mm > 800:
-                                confidence *= 0.8
-                            
-                            # Reduce confidence for large yaw
-                            if iris_result.head_pose and abs(iris_result.head_pose.yaw) > 10:
-                                confidence *= 0.9
-                            
-                            pd_values.append(pd_mm)
+                        # Create engine for this session (or reuse if exists)
+                        if not hasattr(self, '_iris_engine'):
+                            self._iris_engine = IrisPDEngine(smoothing_window=1)  # No smoothing per frame
+                        
+                        # Process frame
+                        result = self._iris_engine.process_frame(image)
+                        
+                        if result['is_valid'] and result['pd_mm']:
+                            pd_values.append(result['pd_mm'])
                             frame_result = {
                                 'frame': i,
                                 'valid': True,
-                                'pd_mm': round(pd_mm, 2),
-                                'confidence': round(confidence, 2),
+                                'pd_mm': result['pd_mm'],
+                                'confidence': result['confidence'],
                                 'blur_score': round(blur_score, 1),
-                                'depth_mm': round(depth_mm, 0),
-                                'iris_px': round(iris_result.iris_diameter_px, 1),
+                                'depth_mm': result['depth_mm'],
+                                'iris_px': result['iris_diameter_px'],
                                 'method': 'iris'
                             }
-                            print(f"[PDService] Frame {i}: PD={pd_mm:.2f}mm, depth={depth_mm:.0f}mm, iris={iris_result.iris_diameter_px:.1f}px")
+                            print(f"[PDService] Frame {i}: PD={result['pd_mm']:.2f}mm, depth={result['depth_mm']:.0f}mm, iris={result['iris_diameter_px']:.1f}px")
                         else:
                             frame_result = {
                                 'frame': i,
                                 'valid': False,
                                 'pd_mm': None,
-                                'confidence': 0,
-                                'rejection_reason': 'Face or iris not detected'
+                                'confidence': result.get('confidence', 0),
+                                'rejection_reason': result.get('error', 'Measurement failed')
                             }
                     else:
                         # Card-based mode: use full pd_engine with card detection
