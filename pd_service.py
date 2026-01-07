@@ -457,12 +457,11 @@ class PDService:
                         # Use proper IrisPDEngine with complete 6-stage algorithm
                         from pd_engine.iris_pd_engine import IrisPDEngine
                         
-                        # Create engine for this session (or reuse if exists)
-                        if not hasattr(self, '_iris_engine'):
-                            self._iris_engine = IrisPDEngine(smoothing_window=1)  # No smoothing per frame
+                        # Create fresh engine for each frame - no state carryover
+                        iris_engine = IrisPDEngine(smoothing_window=1)  # No smoothing per frame
                         
                         # Process frame
-                        result = self._iris_engine.process_frame(image)
+                        result = iris_engine.process_frame(image)
                         
                         if result['is_valid'] and result['pd_mm']:
                             pd_values.append(result['pd_mm'])
