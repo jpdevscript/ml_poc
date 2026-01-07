@@ -378,17 +378,22 @@ class PDService:
                 'details': {}
             }
     
-    def measure_pd_multi(self, images: list) -> Dict[str, Any]:
+    def measure_pd_multi(self, images: list, method: str = None) -> Dict[str, Any]:
         """
         Measure PD from multiple images and perform statistical averaging.
         Uses IQR outlier rejection for robust estimation.
         
         Args:
             images: List of numpy arrays (BGR images)
+            method: 'card' (default) or 'iris' for iris-only measurement
             
         Returns:
             Dict with averaged PD value and statistical info
         """
+        # Normalize method
+        use_iris_only = method and method.lower() == 'iris'
+        print(f"[PDService] Multi-frame measurement - method: {'iris' if use_iris_only else 'card'}")
+        
         try:
             import time
             start_time = time.time()
@@ -448,16 +453,80 @@ class PDService:
                 
                 # Process frame with debug enabled for this frame
                 try:
-                    result = self.pd_engine.process_frame(image, debug_dir=frame_debug_dir)
-                    frame_result = {
-                        'frame': i,
-                        'valid': result.is_valid,
-                        'pd_mm': round(result.pd_final_mm, 2) if result.is_valid else None,
-                        'confidence': round(result.confidence, 2) if result.is_valid else 0,
-                        'blur_score': round(blur_score, 1)
-                    }
-                    if result.is_valid:
-                        pd_values.append(result.pd_final_mm)
+                    if use_iris_only:
+                        # Iris-only mode: use IrisMeasurer directly
+                        from pd_engine.measurement import IrisMeasurer
+                        measurer = IrisMeasurer()
+                        iris_result = measurer.measure(image)
+                        
+                        if iris_result.detected and iris_result.raw_pd_px:
+                            # Hybrid method: use iris at close distance, inter-eye at far
+                            pd_iris = None
+                            pd_intereye = None
+                            
+                            if iris_result.iris_diameter_px and iris_result.iris_diameter_px > 0:
+                                CALIBRATED_IRIS_MM = 12.66
+                                pd_iris = iris_result.raw_pd_px * (CALIBRATED_IRIS_MM / iris_result.iris_diameter_px)
+                            
+                            if iris_result.inter_eye_distance_px and iris_result.inter_eye_distance_px > 0:
+                                CALIBRATED_CONSTANT = 91.8
+                                pd_to_intereye_ratio = iris_result.raw_pd_px / iris_result.inter_eye_distance_px
+                                pd_intereye = pd_to_intereye_ratio * CALIBRATED_CONSTANT
+                            
+                            # Choose method based on iris size
+                            iris_px = iris_result.iris_diameter_px or 0
+                            
+                            if iris_px >= 35:
+                                pd_mm = pd_iris if pd_iris else pd_intereye
+                            elif iris_px <= 30:
+                                pd_mm = pd_intereye if pd_intereye else pd_iris
+                            else:
+                                # Blend zone
+                                if pd_iris and pd_intereye:
+                                    weight = (iris_px - 30) / 5.0
+                                    pd_mm = pd_iris * weight + pd_intereye * (1 - weight)
+                                else:
+                                    pd_mm = pd_iris or pd_intereye
+                            
+                            if pd_mm:
+                                pd_values.append(pd_mm)
+                                frame_result = {
+                                    'frame': i,
+                                    'valid': True,
+                                    'pd_mm': round(pd_mm, 2),
+                                    'confidence': 0.8,
+                                    'blur_score': round(blur_score, 1),
+                                    'method': 'iris'
+                                }
+                            else:
+                                frame_result = {
+                                    'frame': i,
+                                    'valid': False,
+                                    'pd_mm': None,
+                                    'confidence': 0,
+                                    'rejection_reason': 'Could not calculate PD'
+                                }
+                        else:
+                            frame_result = {
+                                'frame': i,
+                                'valid': False,
+                                'pd_mm': None,
+                                'confidence': 0,
+                                'rejection_reason': 'Face not detected'
+                            }
+                    else:
+                        # Card-based mode: use full pd_engine with card detection
+                        result = self.pd_engine.process_frame(image, debug_dir=frame_debug_dir)
+                        frame_result = {
+                            'frame': i,
+                            'valid': result.is_valid,
+                            'pd_mm': round(result.pd_final_mm, 2) if result.is_valid else None,
+                            'confidence': round(result.confidence, 2) if result.is_valid else 0,
+                            'blur_score': round(blur_score, 1),
+                            'method': result.calibration_method if result.is_valid else None
+                        }
+                        if result.is_valid:
+                            pd_values.append(result.pd_final_mm)
                 except Exception as e:
                     print(f"[PDService] Frame {i} error: {e}")
                     frame_result = {

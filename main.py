@@ -97,6 +97,7 @@ async def measure_pd(request: Base64ImageRequest):
 class MultiFrameImageRequest(BaseModel):
     """Request with multiple base64 encoded images for statistical averaging."""
     images: List[str]
+    method: Optional[str] = None  # 'card' (default) or 'iris'
 
 
 @app.post("/api/measure-pd-multi")
@@ -124,7 +125,7 @@ async def measure_pd_multi(request: MultiFrameImageRequest):
             raise HTTPException(status_code=400, detail="Less than 2 valid images after decoding")
         
         service = get_pd_service()
-        result = service.measure_pd_multi(images)
+        result = service.measure_pd_multi(images, method=request.method)
         return JSONResponse(content=result)
     except HTTPException:
         raise
