@@ -267,11 +267,12 @@ class PDMeasurement:
             
             if scale_factor is None and self.fallback_to_iris:
                 # Fallback: Use iris diameter estimation
-                # Average human iris diameter is 11.7mm (range: 10.5-13mm)
+                # Calibrated iris diameter: MediaPipe landmarks measure a larger area
+                # than the true iris (11.7mm). Empirically calibrated: 12.66mm
+                IRIS_CALIBRATED_MM = 12.66
                 iris_size = iris_result.iris_diameter_px if iris_result.iris_diameter_px else self._estimate_iris_size(iris_result)
                 if iris_size and iris_size > 0:
-                    # Use 11.7mm as the medical standard iris diameter
-                    scale_factor = 11.7 / iris_size
+                    scale_factor = IRIS_CALIBRATED_MM / iris_size
                     result.calibration_method = "iris"
                     
                     # Estimate camera distance from iris diameter for better depth correction
@@ -280,7 +281,7 @@ class PDMeasurement:
                     camera_distance = PDCorrector.estimate_camera_distance_from_iris(
                         iris_diameter_px=iris_size,
                         focal_length_px=focal_length,
-                        avg_iris_diameter_mm=11.7
+                        avg_iris_diameter_mm=IRIS_CALIBRATED_MM
                     )
                     
                     result.warnings.append(

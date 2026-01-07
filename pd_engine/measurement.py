@@ -41,6 +41,7 @@ class IrisMeasurement:
     right_iris: Optional[Tuple[float, float]] = None  # (x, y) in pixels
     raw_pd_px: Optional[float] = None  # Raw PD in pixels
     iris_diameter_px: Optional[float] = None  # Average iris diameter in pixels
+    inter_eye_distance_px: Optional[float] = None  # Distance between outer eye corners (more stable)
     head_pose: Optional[HeadPose] = None
     face_landmarks: Optional[np.ndarray] = None
     confidence: float = 0.0
@@ -182,6 +183,16 @@ class IrisMeasurer:
         except IndexError:
             iris_diameter_px = None
         
+        # Calculate inter-eye distance (outer canthal distance)
+        # Landmarks 33 (left outer eye corner) and 263 (right outer eye corner)
+        # This is more stable than iris diameter for scaling purposes
+        try:
+            left_outer_eye = (landmarks_px[33][0], landmarks_px[33][1])
+            right_outer_eye = (landmarks_px[263][0], landmarks_px[263][1])
+            inter_eye_distance_px = euclidean_distance(left_outer_eye, right_outer_eye)
+        except IndexError:
+            inter_eye_distance_px = None
+        
         # Estimate head pose
         head_pose = self._estimate_head_pose(landmarks_px, image.shape)
         
@@ -202,6 +213,7 @@ class IrisMeasurer:
             right_iris=right_iris,
             raw_pd_px=raw_pd_px,
             iris_diameter_px=iris_diameter_px,
+            inter_eye_distance_px=inter_eye_distance_px,
             head_pose=head_pose,
             face_landmarks=landmarks_px,
             confidence=confidence,

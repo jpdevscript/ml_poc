@@ -284,20 +284,20 @@ class PDCorrector:
     def estimate_pd_without_card(
         raw_pd_px: float,
         iris_diameter_px: float,
-        avg_iris_diameter_mm: float = 11.7
+        avg_iris_diameter_mm: float = 12.66  # Calibrated for MediaPipe landmarks
     ) -> float:
         """
         Estimate PD using iris diameter as a reference (fallback method).
         
-        Average human iris diameter is ~11.7mm, which can be used as a
-        reference when no card is available.
+        MediaPipe landmarks measure a larger area than the true iris (11.7mm).
+        The calibrated value of 12.66mm accounts for this difference.
         
         Note: This is less accurate than card calibration.
         
         Args:
             raw_pd_px: Raw PD in pixels
             iris_diameter_px: Detected iris diameter in pixels
-            avg_iris_diameter_mm: Average iris diameter (default: 11.7mm)
+            avg_iris_diameter_mm: Calibrated iris diameter (default: 12.66mm)
             
         Returns:
             Estimated PD in mm
@@ -312,23 +312,21 @@ class PDCorrector:
     def estimate_camera_distance_from_iris(
         iris_diameter_px: float,
         focal_length_px: float,
-        avg_iris_diameter_mm: float = 11.7
+        avg_iris_diameter_mm: float = 12.66  # Calibrated for MediaPipe landmarks
     ) -> float:
         """
         Estimate camera distance using the iris diameter constant.
         
-        The human iris has a nearly constant horizontal diameter of 11.7mm (±0.5mm).
+        MediaPipe landmarks measure a larger area than the true iris (11.7mm).
+        The calibrated value of 12.66mm accounts for this difference.
         Using the pinhole camera model:
         
             d_camera = (iris_diameter_mm × focal_length_px) / iris_diameter_px
         
-        This provides a more accurate camera distance estimate than assumptions,
-        which improves depth correction accuracy.
-        
         Args:
             iris_diameter_px: Detected iris diameter in pixels
             focal_length_px: Camera focal length in pixels (from EXIF or estimated)
-            avg_iris_diameter_mm: Average iris diameter (default: 11.7mm)
+            avg_iris_diameter_mm: Calibrated iris diameter (default: 12.66mm)
             
         Returns:
             Estimated camera distance in mm

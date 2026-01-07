@@ -119,7 +119,8 @@ def test_card_detection(
 def test_full_pd(
     image_path: str, 
     debug_dir: str, 
-    use_forehead: bool = True
+    use_forehead: bool = True,
+    iris_only: bool = False
 ) -> Optional[PDResult]:
     """
     Test full PD measurement pipeline with quality gates.
@@ -183,10 +184,104 @@ def test_full_pd(
             )
             print(f"  Iris Diameter: {iris_result.iris_diameter_px:.1f} px")
             print(f"  Est. Camera Distance (from iris): {camera_dist:.0f} mm")
+            
+            # Calculate iris-based PD for comparison
+            if iris_result.raw_pd_px:
+                # Calibrated iris diameter (empirically derived from actual PD measurements)
+                IRIS_CALIBRATED_MM = 12.66
+                iris_scale_factor = IRIS_CALIBRATED_MM / iris_result.iris_diameter_px
+                iris_pd_mm = iris_result.raw_pd_px * iris_scale_factor
+                print(f"\n  --- IRIS-BASED PD (for comparison) ---")
+                print(f"  Raw PD: {iris_result.raw_pd_px:.1f} px")
+                print(f"  Iris Scale Factor: {iris_scale_factor:.4f} mm/px")
+                print(f"  Iris-based PD: {iris_pd_mm:.2f} mm")
     else:
         print(f"  Face Detection: ✗ FAIL - {iris_result.error_message}")
     
-    # Create PD engine
+    # If iris-only mode, use direct iris-based calculation
+    if iris_only:
+        print_section("IRIS-ONLY PD MEASUREMENT")
+        if not iris_result.detected:
+            print("  ✗ Cannot measure - no face detected")
+            return None
+        
+        if not iris_result.raw_pd_px:
+            print("  ✗ Cannot measure - iris landmarks not available")
+            return None
+        
+        # Hybrid method: Use iris-based at close distances, inter-eye at far distances
+        # - Iris method works better when iris is large (close camera, >35px)
+        # - Inter-eye method works better when iris is small (far camera, <30px)
+        # - Blend between 30-35px
+        
+        pd_iris = None
+        pd_intereye = None
+        
+        # Calculate iris-based PD
+        if iris_result.iris_diameter_px and iris_result.iris_diameter_px > 0:
+            CALIBRATED_IRIS_MM = 12.66
+            scale_factor = CALIBRATED_IRIS_MM / iris_result.iris_diameter_px
+            pd_iris = iris_result.raw_pd_px * scale_factor
+        
+        # Calculate inter-eye based PD
+        if iris_result.inter_eye_distance_px and iris_result.inter_eye_distance_px > 0:
+            CALIBRATED_CONSTANT = 91.8
+            pd_to_intereye_ratio = iris_result.raw_pd_px / iris_result.inter_eye_distance_px
+            pd_intereye = pd_to_intereye_ratio * CALIBRATED_CONSTANT
+        
+        # Choose method based on iris size (proxy for camera distance)
+        iris_px = iris_result.iris_diameter_px or 0
+        
+        if iris_px >= 35:
+            # Close distance: use iris method (more accurate)
+            pd_mm = pd_iris if pd_iris else pd_intereye
+            method = "iris (close distance)"
+        elif iris_px <= 30:
+            # Far distance: use inter-eye method (more stable)
+            pd_mm = pd_intereye if pd_intereye else pd_iris
+            method = "inter-eye (far distance)"
+        else:
+            # Blend zone (30-35px): weighted average
+            if pd_iris and pd_intereye:
+                weight = (iris_px - 30) / 5.0  # 0 at 30px, 1 at 35px
+                pd_mm = pd_iris * weight + pd_intereye * (1 - weight)
+                method = f"hybrid (iris:{weight:.0%}/intereye:{1-weight:.0%})"
+            elif pd_iris:
+                pd_mm = pd_iris
+                method = "iris (fallback)"
+            else:
+                pd_mm = pd_intereye
+                method = "inter-eye (fallback)"
+        
+        if pd_mm is None:
+            print("  ✗ Cannot measure - no reference landmarks available")
+            return None
+        
+        # Apply yaw correction if head pose available
+        if iris_result.head_pose and abs(iris_result.head_pose.yaw) > 1:
+            import math
+            yaw_correction = 1.0 / math.cos(math.radians(min(abs(iris_result.head_pose.yaw), 60)))
+            pd_corrected = pd_mm * yaw_correction
+            print(f"  ✓ Iris-based PD: {pd_corrected:.2f} mm (yaw-corrected)")
+            print(f"    Raw PD (no yaw correction): {pd_mm:.2f} mm")
+            print(f"    Yaw Correction: ×{yaw_correction:.4f}")
+        else:
+            pd_corrected = pd_mm
+            print(f"  ✓ Iris-based PD: {pd_corrected:.2f} mm")
+        
+        print(f"    Raw PD: {iris_result.raw_pd_px:.1f} px")
+        print(f"    Iris Diameter: {iris_result.iris_diameter_px:.1f} px")
+        if iris_result.inter_eye_distance_px:
+            print(f"    Inter-Eye: {iris_result.inter_eye_distance_px:.1f} px")
+        if pd_iris:
+            print(f"    PD (iris): {pd_iris:.2f} mm")
+        if pd_intereye:
+            print(f"    PD (inter-eye): {pd_intereye:.2f} mm")
+        print(f"    Method: {method}")
+        
+        return None  # No PDResult object for iris-only mode
+    
+    # Create PD engine (with card detection)
     print_section("PD MEASUREMENT")
     engine = PDMeasurement()
     
@@ -260,6 +355,8 @@ def main() -> None:
                         help="Base directory for debug output")
     parser.add_argument("--card-only", action="store_true",
                         help="Only test card detection")
+    parser.add_argument("--iris-method", action="store_true",
+                        help="Use iris-based PD measurement only (skip card detection)")
     parser.add_argument("--no-forehead", action="store_true",
                         help="Disable forehead ROI detection")
     
@@ -276,14 +373,15 @@ def main() -> None:
     print_header("PD MEASUREMENT DEMO")
     print(f"  Input: {args.image_path}")
     print(f"  Output: {debug_dir}")
-    print(f"  Mode: {'Card Detection Only' if args.card_only else 'Full PD Measurement'}")
+    mode_str = "Card Detection Only" if args.card_only else ("Iris-Only PD" if args.iris_method else "Full PD Measurement")
+    print(f"  Mode: {mode_str}")
     
     use_forehead = not args.no_forehead
     
     if args.card_only:
         test_card_detection(args.image_path, debug_dir, use_forehead)
     else:
-        test_full_pd(args.image_path, debug_dir, use_forehead)
+        test_full_pd(args.image_path, debug_dir, use_forehead, iris_only=args.iris_method)
     
     print_summary(debug_dir)
     print("\n✓ Done!")
