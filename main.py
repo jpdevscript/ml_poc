@@ -6,6 +6,9 @@ Provides endpoints for face detection guidance and PD calculation.
 import io
 import os
 import base64
+import hmac
+import hashlib
+import time
 from typing import Optional, List
 
 import cv2
@@ -20,8 +23,75 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pd_service import get_pd_service
 
 # Security configuration from environment
-API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
+TOKEN_SECRET = os.getenv("TOKEN_SECRET", "dev-secret-change-in-production")
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
+TOKEN_EXPIRY_SECONDS = 60
+
+# Rate limiting configuration
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "20"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # seconds
+
+# Simple in-memory rate limiter (use Redis in production for multi-instance)
+rate_limit_store: dict = {}
+
+
+def validate_token(token: str) -> tuple[bool, str]:
+    """Validate HMAC-signed token."""
+    if not token:
+        return False, "Missing token"
+    
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False, "Invalid token format"
+    
+    timestamp_str, nonce, provided_signature = parts
+    
+    try:
+        timestamp = int(timestamp_str)
+    except ValueError:
+        return False, "Invalid timestamp"
+    
+    # Check expiry
+    now = int(time.time())
+    if now - timestamp > TOKEN_EXPIRY_SECONDS:
+        return False, "Token expired"
+    
+    # Verify signature
+    payload = f"{timestamp_str}.{nonce}"
+    expected_signature = hmac.new(
+        TOKEN_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    
+    if not hmac.compare_digest(provided_signature, expected_signature):
+        return False, "Invalid signature"
+    
+    return True, ""
+
+
+def check_rate_limit(client_ip: str) -> tuple[bool, int]:
+    """Check if client IP has exceeded rate limit. Returns (allowed, remaining)."""
+    now = time.time()
+    
+    # Clean old entries
+    if client_ip in rate_limit_store:
+        rate_limit_store[client_ip] = [
+            t for t in rate_limit_store[client_ip]
+            if now - t < RATE_LIMIT_WINDOW
+        ]
+    else:
+        rate_limit_store[client_ip] = []
+    
+    # Check limit
+    request_count = len(rate_limit_store[client_ip])
+    if request_count >= RATE_LIMIT_REQUESTS:
+        return False, 0
+    
+    # Add new request
+    rate_limit_store[client_ip].append(now)
+    return True, RATE_LIMIT_REQUESTS - request_count - 1
+
 
 # Create FastAPI app
 app = FastAPI(
@@ -31,12 +101,13 @@ app = FastAPI(
 )
 
 
-class APIKeyMiddleware(BaseHTTPMiddleware):
-    """Middleware to validate API key on /api/* routes."""
+class SecurityMiddleware(BaseHTTPMiddleware):
+    """Middleware to validate tokens, origin, and rate limits on /api/* routes."""
     
     async def dispatch(self, request: Request, call_next):
-        # Skip validation for non-API routes (health check, static files, docs)
         path = request.url.path
+        
+        # Skip validation for non-API routes (health check, static files, docs)
         if not path.startswith("/api/"):
             return await call_next(request)
         
@@ -44,20 +115,47 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         if request.method == "OPTIONS":
             return await call_next(request)
         
-        # Validate API key if configured
-        if API_SECRET_KEY:
-            api_key = request.headers.get("X-API-Key", "")
-            if api_key != API_SECRET_KEY:
+        # Get client IP (handle proxy headers)
+        client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        if not client_ip:
+            client_ip = request.client.host if request.client else "unknown"
+        
+        # 1. Rate limiting
+        allowed, remaining = check_rate_limit(client_ip)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Try again later."},
+                headers={"Retry-After": str(RATE_LIMIT_WINDOW)}
+            )
+        
+        # 2. Origin validation (if ALLOWED_ORIGIN is set)
+        if ALLOWED_ORIGIN != "*":
+            origin = request.headers.get("Origin", "")
+            # Allow requests without Origin header (direct API calls from same server)
+            if origin and origin != ALLOWED_ORIGIN:
                 return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Invalid or missing API key"}
+                    status_code=403,
+                    content={"detail": "Origin not allowed"}
                 )
         
-        return await call_next(request)
+        # 3. Token validation (if TOKEN_SECRET is set)
+        if TOKEN_SECRET and TOKEN_SECRET != "dev-secret-change-in-production":
+            token = request.headers.get("X-Request-Token", "")
+            valid, error = validate_token(token)
+            if not valid:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": f"Authentication failed: {error}"}
+                )
+        
+        response = await call_next(request)
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+        return response
 
 
-# Add API key validation middleware (before CORS)
-app.add_middleware(APIKeyMiddleware)
+# Add security middleware (before CORS)
+app.add_middleware(SecurityMiddleware)
 
 # Add CORS middleware for frontend
 # Use specific origin in production for security
