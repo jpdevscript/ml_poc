@@ -10,13 +10,18 @@ from typing import Optional, List
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from pd_service import get_pd_service
+
+# Security configuration from environment
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
+ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
 
 # Create FastAPI app
 app = FastAPI(
@@ -25,10 +30,41 @@ app = FastAPI(
     version="1.0.0"
 )
 
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    """Middleware to validate API key on /api/* routes."""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Skip validation for non-API routes (health check, static files, docs)
+        path = request.url.path
+        if not path.startswith("/api/"):
+            return await call_next(request)
+        
+        # Skip validation for OPTIONS requests (CORS preflight)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        
+        # Validate API key if configured
+        if API_SECRET_KEY:
+            api_key = request.headers.get("X-API-Key", "")
+            if api_key != API_SECRET_KEY:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid or missing API key"}
+                )
+        
+        return await call_next(request)
+
+
+# Add API key validation middleware (before CORS)
+app.add_middleware(APIKeyMiddleware)
+
 # Add CORS middleware for frontend
+# Use specific origin in production for security
+allowed_origins = [ALLOWED_ORIGIN] if ALLOWED_ORIGIN != "*" else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
