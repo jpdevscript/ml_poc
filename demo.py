@@ -219,15 +219,15 @@ def test_full_pd(
         
         # Calculate iris-based PD
         if iris_result.iris_diameter_px and iris_result.iris_diameter_px > 0:
-            # Calibrated constant - reduced to fix +2mm error
-            CALIBRATED_IRIS_MM = 12.35
+            # Calibrated: 12.75→+2mm, 12.35→-3mm, using 12.55 as midpoint
+            CALIBRATED_IRIS_MM = 12.55
             scale_factor = CALIBRATED_IRIS_MM / iris_result.iris_diameter_px
             pd_iris = iris_result.raw_pd_px * scale_factor
         
         # Calculate inter-eye based PD
         if iris_result.inter_eye_distance_px and iris_result.inter_eye_distance_px > 0:
-            # Reduced constant to fix +2mm error
-            CALIBRATED_CONSTANT = 87.0
+            # Calibrated: 90→+2mm, 87→-3mm, using 88.5 as midpoint
+            CALIBRATED_CONSTANT = 88.5
             pd_to_intereye_ratio = iris_result.raw_pd_px / iris_result.inter_eye_distance_px
             pd_intereye = pd_to_intereye_ratio * CALIBRATED_CONSTANT
         
