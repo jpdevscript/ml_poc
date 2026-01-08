@@ -21,7 +21,7 @@ import math
 # Iris biometric constant
 # NOTE: Anatomical iris is 11.7mm, but MediaPipe landmarks measure a smaller region
 # Calibrated: 12.75→+2mm, 12.35→-3mm, using 12.55 as midpoint
-IRIS_DIAMETER_MM = 12.55  # Calibrated for close-distance capture
+IRIS_DIAMETER_MM = 12.60  # Calibrated for close-distance capture
 
 # Valid measurement ranges
 PD_MIN_MM = 50.0          # Minimum realistic pupillary distance
