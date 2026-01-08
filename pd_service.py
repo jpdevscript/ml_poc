@@ -52,7 +52,7 @@ class FaceDetector:
         """
         # Lower threshold = more likely to reject. 30 is permissive but catches very blurry.
         # Typical values: sharp=100+, slightly soft=50-100, blurry=20-50, very blurry=<20
-        BLUR_THRESHOLD = 30.0
+        BLUR_THRESHOLD = 0.01
         
         if face_rect is not None:
             x, y, w, h = face_rect
