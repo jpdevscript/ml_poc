@@ -30,19 +30,20 @@ import math
 HVID_MM = 11.7
 
 # Bias correction for MediaPipe landmark underestimation
-# MediaPipe's "refinement" landmarks sit slightly inside the actual limbus
-# Calibrated from ground truth:
-#   iris=39.6px → need bias 1.096 (larger iris = close = more correction)
-#   iris=21.1px → need bias 1.063 (smaller iris = far = less correction)
+# Calibrated from ground truth (3 points):
+#   iris=39.6px → 63.5mm (laptop)
+#   iris=21.1px → 66.5mm (laptop far)
+#   iris=37.5px → 66.5mm (mobile)
 # Formula: bias = BASE + (iris_px - REF) * SCALE
-BIAS_BASE = 1.088           # Base bias at reference iris size
+BIAS_BASE = 1.06            # Reduced base for better mobile fit
 BIAS_REFERENCE_IRIS_PX = 35  # Reference iris size in pixels
-BIAS_SCALE_FACTOR = 0.0018   # How much bias changes per pixel (larger iris = more bias)
+BIAS_SCALE_FACTOR = 0.0008   # Reduced scale for more stable cross-device results
 
-# Resolution-adaptive correction (additional on top of iris-size adaptive)
-# At resolutions < 720p, MediaPipe underestimation is worse
+# Resolution/orientation-adaptive correction
+# Laptops (landscape, width > height) tend to underestimate more than mobile
 LOW_RES_THRESHOLD = 720  # pixels (height)
-LOW_RES_ADDITIONAL_BIAS = 0.03  # +3% correction (reduced since iris-adaptive handles most)
+LOW_RES_ADDITIONAL_BIAS = 0.03  # +3% for low-res
+LANDSCAPE_ADDITIONAL_BIAS = 0.02  # +2% for landscape (laptop webcams)
 
 # Vergence correction for Far PD
 # At close range (phone/laptop), eyes converge inward
@@ -236,7 +237,7 @@ class IrisPDEngine:
         return min(1.0, 0.5 + quality * 0.5)  # Range 0.5-1.0 for symmetric
     
     def _calculate_pd(self, pd_px: float, avg_iris_px: float, 
-                      image_height: int) -> float:
+                      image_height: int, image_width: int) -> float:
         """
         Calculate PD using ratio method with iris-size adaptive bias.
         
@@ -249,6 +250,7 @@ class IrisPDEngine:
             pd_px: Inter-pupillary distance in pixels
             avg_iris_px: Average iris diameter in pixels  
             image_height: Image height for resolution-adaptive scaling
+            image_width: Image width for orientation detection
             
         Returns:
             PD in millimeters
@@ -269,6 +271,11 @@ class IrisPDEngine:
         # Resolution-adaptive correction (additional)
         if image_height < LOW_RES_THRESHOLD:
             pd_mm *= (1.0 + LOW_RES_ADDITIONAL_BIAS)
+        
+        # Landscape correction (laptop webcams tend to underestimate more)
+        is_landscape = image_width > image_height
+        if is_landscape:
+            pd_mm *= (1.0 + LANDSCAPE_ADDITIONAL_BIAS)
         
         # Vergence correction (if enabled)
         if APPLY_VERGENCE_CORRECTION:
@@ -336,7 +343,7 @@ class IrisPDEngine:
             }
         
         # Stage 4: Calculate PD using ratio method
-        raw_pd_mm = self._calculate_pd(pd_px, avg_iris_px, h)
+        raw_pd_mm = self._calculate_pd(pd_px, avg_iris_px, h, w)
         
         # Stage 5: Temporal smoothing with Kalman filter
         smoothed_pd = self.kalman.update(raw_pd_mm)
