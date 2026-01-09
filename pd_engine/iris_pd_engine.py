@@ -31,14 +31,18 @@ HVID_MM = 11.7
 
 # Bias correction for MediaPipe landmark underestimation
 # MediaPipe's "refinement" landmarks sit slightly inside the actual limbus
-# Calibrated: laptop=1.09, mobile=1.095 (mobile was 0.4mm low)
-BIAS_CORRECTION_FACTOR = 1.095
+# Calibrated from ground truth:
+#   iris=39.6px → need bias 1.096 (larger iris = close = more correction)
+#   iris=21.1px → need bias 1.063 (smaller iris = far = less correction)
+# Formula: bias = BASE + (iris_px - REF) * SCALE
+BIAS_BASE = 1.088           # Base bias at reference iris size
+BIAS_REFERENCE_IRIS_PX = 35  # Reference iris size in pixels
+BIAS_SCALE_FACTOR = 0.0018   # How much bias changes per pixel (larger iris = more bias)
 
-# Resolution-adaptive correction
+# Resolution-adaptive correction (additional on top of iris-size adaptive)
 # At resolutions < 720p, MediaPipe underestimation is worse
-# This adds additional correction for low-res inputs
 LOW_RES_THRESHOLD = 720  # pixels (height)
-LOW_RES_ADDITIONAL_BIAS = 0.05  # +5% correction
+LOW_RES_ADDITIONAL_BIAS = 0.03  # +3% correction (reduced since iris-adaptive handles most)
 
 # Vergence correction for Far PD
 # At close range (phone/laptop), eyes converge inward
@@ -234,9 +238,12 @@ class IrisPDEngine:
     def _calculate_pd(self, pd_px: float, avg_iris_px: float, 
                       image_height: int) -> float:
         """
-        Calculate PD using ratio method.
+        Calculate PD using ratio method with iris-size adaptive bias.
         
-        Formula: PD_mm = (PD_px / avg_iris_px) × HVID_mm × BIAS_CORRECTION
+        Formula: PD_mm = (PD_px / avg_iris_px) × HVID_mm × adaptive_bias
+        
+        The adaptive bias compensates for the fact that MediaPipe's iris underestimation
+        varies with iris size (which correlates with distance and device).
         
         Args:
             pd_px: Inter-pupillary distance in pixels
@@ -246,14 +253,21 @@ class IrisPDEngine:
         Returns:
             PD in millimeters
         """
-        # Base calculation using ratio method
-        # Since both PD_px and avg_iris_px are in pixels, focal length cancels out
-        ratio = pd_px / avg_iris_px
-        pd_mm = ratio * HVID_MM * BIAS_CORRECTION_FACTOR
+        # Calculate iris-size adaptive bias
+        # Larger iris (close) gets higher bias, smaller iris (far) gets lower bias
+        # This matches calibration: close cameras underestimate more
+        iris_deviation = avg_iris_px - BIAS_REFERENCE_IRIS_PX  # positive when iris is large
+        adaptive_bias = BIAS_BASE + (iris_deviation * BIAS_SCALE_FACTOR)
         
-        # Resolution-adaptive correction
+        # Clamp bias to reasonable range
+        adaptive_bias = max(1.02, min(1.15, adaptive_bias))
+        
+        # Base calculation using ratio method
+        ratio = pd_px / avg_iris_px
+        pd_mm = ratio * HVID_MM * adaptive_bias
+        
+        # Resolution-adaptive correction (additional)
         if image_height < LOW_RES_THRESHOLD:
-            # At low resolutions, MediaPipe underestimates more
             pd_mm *= (1.0 + LOW_RES_ADDITIONAL_BIAS)
         
         # Vergence correction (if enabled)
@@ -348,6 +362,10 @@ class IrisPDEngine:
             confidence >= CONFIDENCE_MIN_THRESHOLD
         )
         
+        # Calculate adaptive bias for this measurement (for debugging)
+        iris_deviation = avg_iris_px - BIAS_REFERENCE_IRIS_PX
+        adaptive_bias = max(1.02, min(1.15, BIAS_BASE + (iris_deviation * BIAS_SCALE_FACTOR)))
+        
         return {
             'pd_mm': round(smoothed_pd, 2) if is_valid else None,
             'pd_raw': round(raw_pd_mm, 2),
@@ -361,9 +379,9 @@ class IrisPDEngine:
             'frame_number': self.frame_count,
             'depth_mm': None,  # Not calculated in ratio method
             # Algorithm info
-            'algorithm': 'ratio',
+            'algorithm': 'ratio_adaptive',
             'hvid_mm': HVID_MM,
-            'bias_factor': BIAS_CORRECTION_FACTOR,
+            'bias_factor': round(adaptive_bias, 3),
             # Landmarks for visualization
             'face_landmarks': result.face_landmarks
         }
@@ -470,7 +488,7 @@ class IrisPDEngine:
         if result.get('quality_score'):
             texts.append(f"Quality: {result['quality_score']:.2f}")
         texts.append(f"Algorithm: {result.get('algorithm', 'ratio')}")
-        texts.append(f"HVID: {HVID_MM}mm | Bias: {BIAS_CORRECTION_FACTOR}")
+        texts.append(f"HVID: {HVID_MM}mm | Bias: {result.get('bias_factor', 'N/A')}")
         
         # Draw text with background
         y_offset = 30
