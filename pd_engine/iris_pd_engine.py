@@ -31,8 +31,8 @@ HVID_MM = 11.7
 
 # Bias correction for MediaPipe landmark underestimation
 # MediaPipe's "refinement" landmarks sit slightly inside the actual limbus
-# Typical range: 1.05 to 1.10 based on research
-BIAS_CORRECTION_FACTOR = 1.09
+# Calibrated: laptop=1.09, mobile=1.095 (mobile was 0.4mm low)
+BIAS_CORRECTION_FACTOR = 1.095
 
 # Resolution-adaptive correction
 # At resolutions < 720p, MediaPipe underestimation is worse
