@@ -198,88 +198,32 @@ def test_full_pd(
     else:
         print(f"  Face Detection: ✗ FAIL - {iris_result.error_message}")
     
-    # If iris-only mode, use direct iris-based calculation
+    # If iris-only mode, use IrisPDEngine (same as pd_service.py)
     if iris_only:
-        print_section("IRIS-ONLY PD MEASUREMENT")
-        if not iris_result.detected:
-            print("  ✗ Cannot measure - no face detected")
-            return None
+        print_section("IRIS-ONLY PD MEASUREMENT (IrisPDEngine)")
         
-        if not iris_result.raw_pd_px:
-            print("  ✗ Cannot measure - iris landmarks not available")
-            return None
+        from pd_engine.iris_pd_engine import IrisPDEngine
         
-        # Hybrid method: Use iris-based at close distances, inter-eye at far distances
-        # - Iris method works better when iris is large (close camera, >35px)
-        # - Inter-eye method works better when iris is small (far camera, <30px)
-        # - Blend between 30-35px
+        # Create engine and process frame
+        iris_engine = IrisPDEngine(smoothing_window=1)
+        result = iris_engine.process_frame(image)
         
-        pd_iris = None
-        pd_intereye = None
-        
-        # Calculate iris-based PD
-        if iris_result.iris_diameter_px and iris_result.iris_diameter_px > 0:
-            # Calibrated: 12.75→+2mm, 12.35→-3mm, using 12.55 as midpoint
-            CALIBRATED_IRIS_MM = 12.55
-            scale_factor = CALIBRATED_IRIS_MM / iris_result.iris_diameter_px
-            pd_iris = iris_result.raw_pd_px * scale_factor
-        
-        # Calculate inter-eye based PD
-        if iris_result.inter_eye_distance_px and iris_result.inter_eye_distance_px > 0:
-            # Calibrated: 90→+2mm, 87→-3mm, using 88.5 as midpoint
-            CALIBRATED_CONSTANT = 88.5
-            pd_to_intereye_ratio = iris_result.raw_pd_px / iris_result.inter_eye_distance_px
-            pd_intereye = pd_to_intereye_ratio * CALIBRATED_CONSTANT
-        
-        # Choose method based on iris size (proxy for camera distance)
-        iris_px = iris_result.iris_diameter_px or 0
-        
-        if iris_px >= 35:
-            # Close distance: use iris method (more accurate)
-            pd_mm = pd_iris if pd_iris else pd_intereye
-            method = "iris (close distance)"
-        elif iris_px <= 30:
-            # Far distance: use inter-eye method (more stable)
-            pd_mm = pd_intereye if pd_intereye else pd_iris
-            method = "inter-eye (far distance)"
+        if result['is_valid'] and result['pd_mm']:
+            print(f"  ✓ PD: {result['pd_mm']:.2f} mm")
+            print(f"    Confidence: {result['confidence']:.2f}")
+            print(f"    Algorithm: {result.get('algorithm', 'ratio')}")
+            print(f"    HVID: {result.get('hvid_mm', 11.7)}mm")
+            print(f"    Bias Factor: {result.get('bias_factor', 1.10)}")
+            print(f"")
+            print(f"    Raw PD: {result.get('pd_px', 0):.1f} px")
+            print(f"    Iris Diameter: {result['iris_diameter_px']:.1f} px")
+            print(f"    Left Iris: {result.get('left_iris_px', 0):.1f} px")
+            print(f"    Right Iris: {result.get('right_iris_px', 0):.1f} px")
+            print(f"    Quality Score: {result.get('quality_score', 0):.2f}")
         else:
-            # Blend zone (30-35px): weighted average
-            if pd_iris and pd_intereye:
-                weight = (iris_px - 30) / 5.0  # 0 at 30px, 1 at 35px
-                pd_mm = pd_iris * weight + pd_intereye * (1 - weight)
-                method = f"hybrid (iris:{weight:.0%}/intereye:{1-weight:.0%})"
-            elif pd_iris:
-                pd_mm = pd_iris
-                method = "iris (fallback)"
-            else:
-                pd_mm = pd_intereye
-                method = "inter-eye (fallback)"
-        
-        if pd_mm is None:
-            print("  ✗ Cannot measure - no reference landmarks available")
-            return None
-        
-        # Apply yaw correction if head pose available
-        if iris_result.head_pose and abs(iris_result.head_pose.yaw) > 1:
-            import math
-            yaw_correction = 1.0 / math.cos(math.radians(min(abs(iris_result.head_pose.yaw), 60)))
-            pd_corrected = pd_mm * yaw_correction
-            print(f"  ✓ Iris-based PD: {pd_corrected:.2f} mm (yaw-corrected)")
-            print(f"    Raw PD (no yaw correction): {pd_mm:.2f} mm")
-            print(f"    Yaw Correction: ×{yaw_correction:.4f}")
-        else:
-            pd_corrected = pd_mm
-            print(f"  ✓ Iris-based PD: {pd_corrected:.2f} mm")
-        
-        print(f"    Raw PD: {iris_result.raw_pd_px:.1f} px")
-        print(f"    Iris Diameter: {iris_result.iris_diameter_px:.1f} px")
-        if iris_result.inter_eye_distance_px:
-            print(f"    Inter-Eye: {iris_result.inter_eye_distance_px:.1f} px")
-        if pd_iris:
-            print(f"    PD (iris): {pd_iris:.2f} mm")
-        if pd_intereye:
-            print(f"    PD (inter-eye): {pd_intereye:.2f} mm")
-        print(f"    Method: {method}")
+            print(f"  ✗ Measurement failed: {result.get('error', 'Unknown error')}")
+            if result.get('iris_diameter_px'):
+                print(f"    Iris Diameter: {result['iris_diameter_px']:.1f} px")
         
         return None  # No PDResult object for iris-only mode
     

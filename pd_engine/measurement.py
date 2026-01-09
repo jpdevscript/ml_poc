@@ -63,8 +63,8 @@ class IrisMeasurer:
         static_image_mode: bool = True,
         max_num_faces: int = 1,
         refine_landmarks: bool = True,
-        min_detection_confidence: float = 0.5,
-        min_tracking_confidence: float = 0.5
+        min_detection_confidence: float = 0.6,
+        min_tracking_confidence: float = 0.6
     ):
         """
         Initialize the iris measurer using FaceLandmarker Tasks API.
@@ -100,7 +100,7 @@ class IrisMeasurer:
             min_face_presence_confidence=min_tracking_confidence,
             min_tracking_confidence=min_tracking_confidence,
             output_face_blendshapes=False,
-            output_facial_transformation_matrixes=False
+            output_facial_transformation_matrixes=True  # Enabled for pose estimation
         )
         self.face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
         

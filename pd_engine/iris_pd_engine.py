@@ -1,11 +1,18 @@
 """
-Complete PD Measurement System using Google MediaPipe Iris
-6-Stage Pipeline with Production-Grade Implementation
+Iris-Based PD Measurement Engine - Ratio Method
 
-Based on the iris biometric constant algorithm where:
-- Iris diameter is 11.7mm (±0.5mm) - biological constant
-- Depth = 11.7mm × focal_length / iris_diameter_px
-- PD = pixel_distance × depth / focal_length
+Uses a geometrically rigorous ratio-based algorithm:
+  PD_mm = (PD_px / avg_iris_px) × HVID_mm × BIAS_CORRECTION
+
+Based on research showing:
+- HVID (Horizontal Visible Iris Diameter) = 11.7mm anatomical mean
+- MediaPipe landmarks underestimate iris by ~5-10%
+- Kalman filter provides superior temporal smoothing vs simple averaging
+
+Key improvements over focal-length method:
+- Focal length cancels out in ratio calculation
+- Device-independent (works across laptop/mobile)
+- More robust to distance variations
 """
 
 import cv2
@@ -15,40 +22,126 @@ from typing import Dict, Optional, Tuple
 import math
 
 # ============================================================================
-# CONSTANTS & BIOLOGICAL PARAMETERS
+# ALGORITHM CONSTANTS
 # ============================================================================
 
-# Iris biometric constant
-# NOTE: Anatomical iris is 11.7mm, but MediaPipe landmarks measure a smaller region
-# Calibrated: 12.75→+2mm, 12.35→-3mm, using 12.55 as midpoint
-IRIS_DIAMETER_MM = 12.60  # Calibrated for close-distance capture
+# Anatomical reference: Horizontal Visible Iris Diameter
+# Global mean HVID is 11.7mm (±0.5mm) - biological constant
+HVID_MM = 11.7
+
+# Bias correction for MediaPipe landmark underestimation
+# MediaPipe's "refinement" landmarks sit slightly inside the actual limbus
+# Typical range: 1.05 to 1.10 based on research
+BIAS_CORRECTION_FACTOR = 1.09
+
+# Resolution-adaptive correction
+# At resolutions < 720p, MediaPipe underestimation is worse
+# This adds additional correction for low-res inputs
+LOW_RES_THRESHOLD = 720  # pixels (height)
+LOW_RES_ADDITIONAL_BIAS = 0.05  # +5% correction
+
+# Vergence correction for Far PD
+# At close range (phone/laptop), eyes converge inward
+# Add ~3mm to convert to "Far PD" for distance glasses
+VERGENCE_CORRECTION_MM = 3.0
+APPLY_VERGENCE_CORRECTION = False  # Set True for distance glasses PD
 
 # Valid measurement ranges
-PD_MIN_MM = 50.0          # Minimum realistic pupillary distance
-PD_MAX_MM = 75.0          # Maximum realistic pupillary distance
-DEPTH_MIN_MM = 150.0      # Minimum sensor-to-face distance (~15cm)
-DEPTH_MAX_MM = 1500.0     # Maximum sensor-to-face distance (~150cm)
+PD_MIN_MM = 50.0          # Minimum realistic adult PD
+PD_MAX_MM = 75.0          # Maximum realistic adult PD
 
-# Temporal smoothing parameters
-SMOOTHING_WINDOW = 10     # Number of frames to accumulate
-OUTLIER_IQR_MULTIPLIER = 1.5  # IQR method threshold
-CONFIDENCE_MIN_THRESHOLD = 0.3  # Minimum confidence to accept (0.3 allows single-frame)
+# Kalman filter parameters
+KALMAN_PROCESS_NOISE = 0.01     # Q: How much we expect PD to change between frames
+KALMAN_MEASUREMENT_NOISE = 1.0  # R: How noisy MediaPipe measurements are
 
-# MediaPipe landmark indices for iris (from the existing implementation)
-LEFT_IRIS_INDICES = [473, 474, 475, 476, 477]    # Center + 4 perimeter points
-RIGHT_IRIS_INDICES = [468, 469, 470, 471, 472]   # Center + 4 perimeter points
+# Quality thresholds
+MIN_IRIS_DIAMETER_PX = 15   # Minimum iris size for valid measurement
+MAX_IRIS_DIAMETER_PX = 80   # Maximum iris size for valid measurement
+IRIS_SYMMETRY_THRESHOLD = 0.7  # Min ratio between left/right iris
+
+# Temporal smoothing
+SMOOTHING_WINDOW = 10  # Number of frames for history
+CONFIDENCE_MIN_THRESHOLD = 0.3
+
+# MediaPipe landmark indices
+# For iris width, use horizontal perimeter landmarks (not center)
+LEFT_IRIS_CENTER = 473
+RIGHT_IRIS_CENTER = 468
+# Horizontal diameter landmarks
+LEFT_IRIS_LEFT = 474    # Left edge of left iris
+LEFT_IRIS_RIGHT = 476   # Right edge of left iris
+RIGHT_IRIS_LEFT = 469   # Left edge of right iris  
+RIGHT_IRIS_RIGHT = 471  # Right edge of right iris
+
+
+class KalmanFilter1D:
+    """
+    Simple 1D Kalman filter for PD smoothing.
+    
+    Much more robust than simple averaging at rejecting
+    MediaPipe's characteristic "jitter noise".
+    """
+    
+    def __init__(self, process_noise: float = KALMAN_PROCESS_NOISE, 
+                 measurement_noise: float = KALMAN_MEASUREMENT_NOISE):
+        self.Q = process_noise      # Process noise covariance
+        self.R = measurement_noise  # Measurement noise covariance
+        
+        # State
+        self.x = None  # Estimated value
+        self.P = 1.0   # Error covariance
+        
+    def reset(self):
+        """Reset filter state."""
+        self.x = None
+        self.P = 1.0
+    
+    def update(self, measurement: float) -> float:
+        """
+        Process a new measurement and return filtered value.
+        
+        Args:
+            measurement: Raw PD measurement
+            
+        Returns:
+            Filtered PD value
+        """
+        if self.x is None:
+            # First measurement - initialize
+            self.x = measurement
+            self.P = 1.0
+            return self.x
+        
+        # Prediction step
+        # State prediction: x_pred = x (assuming PD doesn't change)
+        x_pred = self.x
+        P_pred = self.P + self.Q
+        
+        # Update step
+        # Kalman gain
+        K = P_pred / (P_pred + self.R)
+        
+        # State update
+        self.x = x_pred + K * (measurement - x_pred)
+        
+        # Covariance update
+        self.P = (1 - K) * P_pred
+        
+        return self.x
 
 
 class IrisPDEngine:
     """
-    Production-grade pupillary distance measurement engine using iris biometrics.
+    Production-grade pupillary distance measurement using ratio method.
     
-    Uses existing IrisMeasurer for landmark detection and adds:
-    - Proper iris diameter estimation (enclosing circle + PCA)
-    - Focal length estimation from FOV
-    - Depth estimation using 11.7mm constant
-    - PD calculation using pinhole model
-    - Temporal smoothing with IQR outlier rejection
+    Algorithm:
+        PD_mm = (PD_px / avg_iris_px) × HVID_mm × BIAS_CORRECTION
+    
+    Where:
+        - PD_px: Distance between iris centers (landmarks 468, 473)
+        - avg_iris_px: Average horizontal iris diameter (landmarks 469/471, 474/476)
+        - HVID_mm: Anatomical constant (11.7mm)
+        - BIAS_CORRECTION: Factor to compensate for MediaPipe underestimation
     """
     
     def __init__(self, smoothing_window: int = SMOOTHING_WINDOW):
@@ -56,212 +149,122 @@ class IrisPDEngine:
         Initialize PD measurement engine.
         
         Args:
-            smoothing_window: Number of frames for temporal averaging
+            smoothing_window: Number of frames for history tracking
         """
-        # Import and create IrisMeasurer (uses MediaPipe Tasks API internally)
+        # Import and create IrisMeasurer
         from pd_engine.measurement import IrisMeasurer
         self.measurer = IrisMeasurer()
         
-        # State management for temporal smoothing
+        # Kalman filter for temporal smoothing
+        self.kalman = KalmanFilter1D(
+            process_noise=KALMAN_PROCESS_NOISE,
+            measurement_noise=KALMAN_MEASUREMENT_NOISE
+        )
+        
+        # History for diagnostics and confidence calculation
         self.pd_history = deque(maxlen=smoothing_window)
-        self.left_iris_history = deque(maxlen=smoothing_window)
-        self.right_iris_history = deque(maxlen=smoothing_window)
-        self.depth_history = deque(maxlen=smoothing_window)
+        self.iris_history = deque(maxlen=smoothing_window)
         self.confidence_history = deque(maxlen=smoothing_window)
         
         self.smoothing_window = smoothing_window
-        self.focal_length_px = None
         self.frame_count = 0
     
-    def estimate_focal_length(self, image_width: int) -> float:
+    def _extract_iris_measurements(self, landmarks_px: np.ndarray, 
+                                    image_height: int) -> Tuple[float, float, float, float, float]:
         """
-        Estimate focal length from image width.
+        Extract iris measurements from landmarks.
         
-        Modern smartphone front cameras typically have:
-        - 70-80° horizontal FOV for front cameras
-        - Using 70° as default for selfie cameras
-        
-        focal_length = (width/2) / tan(FOV/2)
+        Uses horizontal perimeter landmarks for width (not enclosing circle).
         
         Args:
-            image_width: Image width in pixels
+            landmarks_px: Array of landmark pixel coordinates
+            image_height: Image height for resolution check
             
         Returns:
-            Focal length in pixels
+            (left_iris_width, right_iris_width, pd_px, left_center, right_center)
         """
-        # Using 70° FOV which is more typical for smartphone front cameras
-        # This is wider than the 50° used in the documentation but matches real devices
-        FOV_HORIZONTAL_DEG = 70
-        fov_rad = math.radians(FOV_HORIZONTAL_DEG)
-        focal_length = (image_width / 2) / math.tan(fov_rad / 2)
-        return focal_length
+        # Left iris horizontal width: landmarks 474 (left edge) and 476 (right edge)
+        left_iris_left = landmarks_px[LEFT_IRIS_LEFT][:2]
+        left_iris_right = landmarks_px[LEFT_IRIS_RIGHT][:2]
+        left_iris_width = np.linalg.norm(np.array(left_iris_right) - np.array(left_iris_left))
+        
+        # Right iris horizontal width: landmarks 469 (left edge) and 471 (right edge)  
+        right_iris_left = landmarks_px[RIGHT_IRIS_LEFT][:2]
+        right_iris_right = landmarks_px[RIGHT_IRIS_RIGHT][:2]
+        right_iris_width = np.linalg.norm(np.array(right_iris_right) - np.array(right_iris_left))
+        
+        # Pupillary distance: between iris centers 468 and 473
+        left_center = landmarks_px[LEFT_IRIS_CENTER][:2]
+        right_center = landmarks_px[RIGHT_IRIS_CENTER][:2]
+        pd_px = np.linalg.norm(np.array(right_center) - np.array(left_center))
+        
+        return left_iris_width, right_iris_width, pd_px, left_center, right_center
     
-    def _estimate_iris_diameter_from_landmarks(self, face_landmarks: np.ndarray, 
-                                                image_height: int,
-                                                image_width: int) -> Tuple[float, float]:
+    def _compute_quality_score(self, left_iris_width: float, 
+                                right_iris_width: float) -> float:
         """
-        Estimate iris diameter using minimal enclosing circle + PCA methods.
+        Compute quality score based on iris detection quality.
         
         Args:
-            face_landmarks: Face landmarks array from IrisMeasurer
-            image_height: Image height
-            image_width: Image width
+            left_iris_width: Left iris width in pixels
+            right_iris_width: Right iris width in pixels
             
         Returns:
-            (left_iris_diameter, right_iris_diameter) in pixels
+            Quality score 0-1
         """
-        # Extract iris contour points
-        left_iris_points = []
-        right_iris_points = []
-        
-        for idx in LEFT_IRIS_INDICES:
-            if idx < len(face_landmarks):
-                x, y = face_landmarks[idx][:2]
-                left_iris_points.append([x, y])
-        
-        for idx in RIGHT_IRIS_INDICES:
-            if idx < len(face_landmarks):
-                x, y = face_landmarks[idx][:2]
-                right_iris_points.append([x, y])
-        
-        left_diameter = self._estimate_single_iris_diameter(np.array(left_iris_points, dtype=np.float32))
-        right_diameter = self._estimate_single_iris_diameter(np.array(right_iris_points, dtype=np.float32))
-        
-        return left_diameter, right_diameter
-    
-    def _estimate_single_iris_diameter(self, iris_points: np.ndarray) -> float:
-        """
-        Estimate iris diameter using TWO robust methods averaged together.
-        
-        Method 1: Minimal Enclosing Circle (Welzl's algorithm)
-        Method 2: PCA-based Major Axis
-        
-        Args:
-            iris_points: (n_points, 2) array of pixel coordinates
-            
-        Returns:
-            Estimated iris diameter in pixels
-        """
-        if len(iris_points) < 3:
+        # Check valid range
+        if not (MIN_IRIS_DIAMETER_PX < left_iris_width < MAX_IRIS_DIAMETER_PX):
+            return 0.0
+        if not (MIN_IRIS_DIAMETER_PX < right_iris_width < MAX_IRIS_DIAMETER_PX):
             return 0.0
         
-        # Method 1: Minimal Enclosing Circle
-        try:
-            (cx, cy), radius = cv2.minEnclosingCircle(iris_points)
-            diameter_method1 = 2 * radius
-        except:
-            diameter_method1 = 0.0
-        
-        # Method 2: PCA-based Major Axis
-        try:
-            mean = iris_points.mean(axis=0)
-            centered_points = iris_points - mean
-            
-            # Covariance matrix
-            if len(centered_points) >= 2:
-                cov = np.cov(centered_points.T)  # 2x2 matrix
-                
-                # Eigenvalue decomposition
-                eigenvalues, _ = np.linalg.eig(cov)
-                max_eigenvalue = np.max(np.abs(eigenvalues))
-                
-                # Diameter = 4 * sqrt(eigenvalue) because points are on perimeter
-                diameter_method2 = 4 * np.sqrt(max_eigenvalue)
-            else:
-                diameter_method2 = diameter_method1
-        except:
-            diameter_method2 = diameter_method1
-        
-        # Average for robustness
-        if diameter_method1 > 0 and diameter_method2 > 0:
-            diameter = (diameter_method1 + diameter_method2) / 2
-        else:
-            diameter = max(diameter_method1, diameter_method2)
-        
-        return float(diameter)
-    
-    def _compute_detection_quality(self, left_iris_diameter: float,
-                                   right_iris_diameter: float) -> float:
-        """
-        Compute quality score for iris detection (0-1 scale).
-        """
-        # Factor 1: Valid range (15-80 pixels typical for selfie)
-        diameter_valid = (15 < left_iris_diameter < 80 and 
-                         15 < right_iris_diameter < 80)
-        
-        if not diameter_valid or max(left_iris_diameter, right_iris_diameter) == 0:
+        # Check symmetry (left and right should be similar)
+        if max(left_iris_width, right_iris_width) == 0:
             return 0.0
+            
+        symmetry_ratio = min(left_iris_width, right_iris_width) / max(left_iris_width, right_iris_width)
         
-        # Factor 2: Similarity (left and right should be similar)
-        diameter_ratio = min(left_iris_diameter, right_iris_diameter) / \
-                        max(left_iris_diameter, right_iris_diameter)
+        if symmetry_ratio < IRIS_SYMMETRY_THRESHOLD:
+            return 0.3  # Low quality but still usable
         
-        # Allow up to 30% difference
-        quality_score = max(0, (diameter_ratio - 0.7) / 0.3)  # Normalize 0.7-1.0 to 0-1
-        
-        return min(1.0, quality_score)
+        # Higher symmetry = higher quality
+        quality = (symmetry_ratio - IRIS_SYMMETRY_THRESHOLD) / (1.0 - IRIS_SYMMETRY_THRESHOLD)
+        return min(1.0, 0.5 + quality * 0.5)  # Range 0.5-1.0 for symmetric
     
-    def smooth_measurements(self, pd_mm: float,
-                           left_iris_diameter: float,
-                           right_iris_diameter: float,
-                           depth_mm: float) -> Tuple[float, float]:
+    def _calculate_pd(self, pd_px: float, avg_iris_px: float, 
+                      image_height: int) -> float:
         """
-        Apply temporal smoothing and IQR outlier rejection.
+        Calculate PD using ratio method.
+        
+        Formula: PD_mm = (PD_px / avg_iris_px) × HVID_mm × BIAS_CORRECTION
+        
+        Args:
+            pd_px: Inter-pupillary distance in pixels
+            avg_iris_px: Average iris diameter in pixels  
+            image_height: Image height for resolution-adaptive scaling
+            
+        Returns:
+            PD in millimeters
         """
-        # Add to history buffers
-        self.pd_history.append(pd_mm)
-        self.left_iris_history.append(left_iris_diameter)
-        self.right_iris_history.append(right_iris_diameter)
-        self.depth_history.append(depth_mm)
+        # Base calculation using ratio method
+        # Since both PD_px and avg_iris_px are in pixels, focal length cancels out
+        ratio = pd_px / avg_iris_px
+        pd_mm = ratio * HVID_MM * BIAS_CORRECTION_FACTOR
         
-        self.frame_count += 1
+        # Resolution-adaptive correction
+        if image_height < LOW_RES_THRESHOLD:
+            # At low resolutions, MediaPipe underestimates more
+            pd_mm *= (1.0 + LOW_RES_ADDITIONAL_BIAS)
         
-        # Need minimum frames for smoothing
-        if len(self.pd_history) < 3:
-            return pd_mm, 0.3  # Low confidence with few frames
+        # Vergence correction (if enabled)
+        if APPLY_VERGENCE_CORRECTION:
+            pd_mm += VERGENCE_CORRECTION_MM
         
-        # IQR Outlier Detection
-        pd_array = np.array(list(self.pd_history))
-        
-        q1 = np.percentile(pd_array, 25)
-        q3 = np.percentile(pd_array, 75)
-        iqr = q3 - q1
-        
-        lower_bound = q1 - OUTLIER_IQR_MULTIPLIER * iqr
-        upper_bound = q3 + OUTLIER_IQR_MULTIPLIER * iqr
-        
-        valid_mask = (pd_array >= lower_bound) & (pd_array <= upper_bound)
-        valid_measurements = pd_array[valid_mask]
-        
-        if len(valid_measurements) == 0:
-            valid_measurements = pd_array
-        
-        # Weighted Average (recent frames weighted more)
-        weights = np.arange(1, len(valid_measurements) + 1) ** 2
-        weights = weights / weights.sum()
-        
-        smoothed_pd_mm = np.average(valid_measurements, weights=weights)
-        
-        # Confidence Scoring
-        measurement_variance = np.var(valid_measurements)
-        variance_confidence = 1.0 / (1.0 + measurement_variance / 10.0)
-        
-        # Iris symmetry check
-        if max(left_iris_diameter, right_iris_diameter) > 0:
-            iris_ratio = min(left_iris_diameter, right_iris_diameter) / max(left_iris_diameter, right_iris_diameter)
-            consistency_bonus = max(0, (iris_ratio - 0.7) / 0.3) * 0.5
-        else:
-            consistency_bonus = 0
-        
-        confidence = min(1.0, variance_confidence * 0.7 + consistency_bonus * 0.3)
-        
-        self.confidence_history.append(confidence)
-        
-        return smoothed_pd_mm, confidence
+        return pd_mm
     
     def process_frame(self, image: np.ndarray) -> Dict:
         """
-        Process single frame through complete 6-stage pipeline.
+        Process single frame through the measurement pipeline.
         
         Args:
             image: OpenCV image (BGR format)
@@ -270,12 +273,9 @@ class IrisPDEngine:
             dict with PD measurement and diagnostics
         """
         h, w = image.shape[:2]
+        self.frame_count += 1
         
-        # Initialize focal length if needed
-        if self.focal_length_px is None:
-            self.focal_length_px = self.estimate_focal_length(w)
-        
-        # STAGE 1: Face Detection using existing IrisMeasurer
+        # Stage 1: Face and iris detection
         result = self.measurer.measure(image)
         
         if not result.detected:
@@ -294,89 +294,85 @@ class IrisPDEngine:
                 'error': 'No landmarks detected'
             }
         
-        # STAGE 2-3: Use iris diameter from IrisMeasurer directly
-        # The IrisMeasurer calculates diameter using horizontal landmark distance
-        # This is the method that has been calibrated
-        if result.iris_diameter_px and result.iris_diameter_px > 0:
-            avg_iris_diameter = result.iris_diameter_px
-        else:
+        # Stage 2: Extract iris measurements using horizontal width landmarks
+        try:
+            left_width, right_width, pd_px, left_center, right_center = \
+                self._extract_iris_measurements(result.face_landmarks, h)
+        except (IndexError, KeyError) as e:
             return {
                 'pd_mm': None,
                 'confidence': 0.0,
                 'is_valid': False,
-                'error': 'Could not estimate iris diameter'
+                'error': f'Iris landmarks not available: {e}'
             }
         
-        # Quality check based on iris size
-        quality_score = 1.0 if (15 < avg_iris_diameter < 80) else 0.5
+        # Average iris width for stable measurement
+        avg_iris_px = (left_width + right_width) / 2
+        
+        # Stage 3: Quality assessment
+        quality_score = self._compute_quality_score(left_width, right_width)
         
         if quality_score < 0.3:
             return {
-                'pd_mm': None,
+                'pd_mm': None, 
                 'confidence': quality_score,
                 'is_valid': False,
-                'error': f'Low iris quality: {quality_score:.2f}'
+                'error': f'Low iris quality: {quality_score:.2f}',
+                'iris_diameter_px': round(avg_iris_px, 1)
             }
         
-        # STAGE 4: Depth Estimation using 11.7mm biological constant
-        depth_mm = (IRIS_DIAMETER_MM * self.focal_length_px) / avg_iris_diameter
+        # Stage 4: Calculate PD using ratio method
+        raw_pd_mm = self._calculate_pd(pd_px, avg_iris_px, h)
         
-        if not (DEPTH_MIN_MM < depth_mm < DEPTH_MAX_MM):
-            return {
-                'pd_mm': None,
-                'confidence': 0.0,
-                'is_valid': False,
-                'error': f'Invalid depth: {depth_mm:.0f}mm'
-            }
+        # Stage 5: Temporal smoothing with Kalman filter
+        smoothed_pd = self.kalman.update(raw_pd_mm)
         
-        # STAGE 5: PD Calculation using pinhole camera model
-        # PD = (pixel_distance × depth) / focal_length
-        if result.raw_pd_px and result.raw_pd_px > 0:
-            px_distance = result.raw_pd_px
-        elif result.left_iris and result.right_iris:
-            px_distance = np.linalg.norm(
-                np.array(result.right_iris) - np.array(result.left_iris)
-            )
+        # Track history
+        self.pd_history.append(raw_pd_mm)
+        self.iris_history.append(avg_iris_px)
+        
+        # Stage 6: Confidence calculation
+        if len(self.pd_history) >= 3:
+            pd_std = np.std(list(self.pd_history))
+            variance_confidence = 1.0 / (1.0 + pd_std / 5.0)  # Lower std = higher confidence
         else:
-            return {
-                'pd_mm': None,
-                'confidence': 0.0,
-                'is_valid': False,
-                'error': 'Could not calculate pixel distance'
-            }
+            variance_confidence = 0.5
         
-        pd_mm = (px_distance * depth_mm) / self.focal_length_px
+        # Combine quality and variance confidence
+        confidence = 0.6 * quality_score + 0.4 * variance_confidence
+        self.confidence_history.append(confidence)
         
-        # STAGE 6: Temporal Smoothing (use avg diameter for both left/right)
-        smoothed_pd, confidence = self.smooth_measurements(
-            pd_mm, avg_iris_diameter, avg_iris_diameter, depth_mm
-        )
-        
-        # Final Validation
+        # Stage 7: Validation
         is_valid = (
             PD_MIN_MM <= smoothed_pd <= PD_MAX_MM and
-            confidence >= CONFIDENCE_MIN_THRESHOLD and
-            quality_score >= 0.4
+            confidence >= CONFIDENCE_MIN_THRESHOLD
         )
         
         return {
             'pd_mm': round(smoothed_pd, 2) if is_valid else None,
-            'pd_raw': round(pd_mm, 2),
-            'depth_mm': round(depth_mm, 0),
+            'pd_raw': round(raw_pd_mm, 2),
             'confidence': round(confidence, 2),
             'is_valid': is_valid,
-            'iris_diameter_px': round(avg_iris_diameter, 1),
+            'iris_diameter_px': round(avg_iris_px, 1),
+            'left_iris_px': round(left_width, 1),
+            'right_iris_px': round(right_width, 1),
+            'pd_px': round(pd_px, 1),
             'quality_score': round(quality_score, 2),
             'frame_number': self.frame_count,
-            'focal_length_px': round(self.focal_length_px, 0)
+            'depth_mm': None,  # Not calculated in ratio method
+            # Algorithm info
+            'algorithm': 'ratio',
+            'hvid_mm': HVID_MM,
+            'bias_factor': BIAS_CORRECTION_FACTOR,
+            # Landmarks for visualization
+            'face_landmarks': result.face_landmarks
         }
     
     def reset(self):
-        """Reset all history buffers for new measurement session."""
+        """Reset all state for new measurement session."""
+        self.kalman.reset()
         self.pd_history.clear()
-        self.left_iris_history.clear()
-        self.right_iris_history.clear()
-        self.depth_history.clear()
+        self.iris_history.clear()
         self.confidence_history.clear()
         self.frame_count = 0
     
@@ -392,8 +388,102 @@ class IrisPDEngine:
         
         pd_array = np.array(list(self.pd_history))
         
-        # Use median for robustness
-        final_pd = np.median(pd_array)
+        # Use Kalman filtered value as final estimate
+        if self.kalman.x is not None:
+            final_pd = self.kalman.x
+        else:
+            final_pd = np.median(pd_array)
+        
         uncertainty = np.std(pd_array)
         
         return round(final_pd, 2), round(uncertainty, 2)
+    
+    def visualize(self, image: np.ndarray, result: Dict, 
+                  landmarks_px: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Create visualization with iris detection overlays.
+        
+        Args:
+            image: Original BGR image
+            result: Result dict from process_frame
+            landmarks_px: Optional face landmarks array
+            
+        Returns:
+            Annotated image
+        """
+        viz = image.copy()
+        h, w = viz.shape[:2]
+        
+        # Colors (BGR)
+        IRIS_COLOR = (0, 255, 255)    # Yellow - iris circles
+        CENTER_COLOR = (0, 255, 0)     # Green - iris centers  
+        PD_COLOR = (255, 0, 255)       # Magenta - PD line
+        TEXT_COLOR = (255, 255, 255)   # White - text
+        BG_COLOR = (0, 0, 0)           # Black - text background
+        
+        # Extract landmarks if available
+        if landmarks_px is not None:
+            try:
+                # Get iris landmarks
+                left_center = landmarks_px[LEFT_IRIS_CENTER][:2]
+                right_center = landmarks_px[RIGHT_IRIS_CENTER][:2]
+                
+                left_iris_l = landmarks_px[LEFT_IRIS_LEFT][:2]
+                left_iris_r = landmarks_px[LEFT_IRIS_RIGHT][:2]
+                right_iris_l = landmarks_px[RIGHT_IRIS_LEFT][:2]
+                right_iris_r = landmarks_px[RIGHT_IRIS_RIGHT][:2]
+                
+                # Draw iris circles
+                left_radius = int(np.linalg.norm(np.array(left_iris_r) - np.array(left_iris_l)) / 2)
+                right_radius = int(np.linalg.norm(np.array(right_iris_r) - np.array(right_iris_l)) / 2)
+                
+                cv2.circle(viz, (int(left_center[0]), int(left_center[1])), left_radius, IRIS_COLOR, 2)
+                cv2.circle(viz, (int(right_center[0]), int(right_center[1])), right_radius, IRIS_COLOR, 2)
+                
+                # Draw iris centers
+                cv2.circle(viz, (int(left_center[0]), int(left_center[1])), 5, CENTER_COLOR, -1)
+                cv2.circle(viz, (int(right_center[0]), int(right_center[1])), 5, CENTER_COLOR, -1)
+                
+                # Draw iris width lines
+                cv2.line(viz, (int(left_iris_l[0]), int(left_iris_l[1])), 
+                        (int(left_iris_r[0]), int(left_iris_r[1])), IRIS_COLOR, 1)
+                cv2.line(viz, (int(right_iris_l[0]), int(right_iris_l[1])), 
+                        (int(right_iris_r[0]), int(right_iris_r[1])), IRIS_COLOR, 1)
+                
+                # Draw PD line between centers
+                cv2.line(viz, (int(left_center[0]), int(left_center[1])),
+                        (int(right_center[0]), int(right_center[1])), PD_COLOR, 2)
+                
+            except (IndexError, KeyError):
+                pass
+        
+        # Add text overlay with semi-transparent background
+        texts = []
+        if result.get('pd_mm'):
+            texts.append(f"PD: {result['pd_mm']:.1f} mm")
+        if result.get('iris_diameter_px'):
+            texts.append(f"Iris: {result['iris_diameter_px']:.1f} px")
+        if result.get('left_iris_px') and result.get('right_iris_px'):
+            texts.append(f"L: {result['left_iris_px']:.1f}  R: {result['right_iris_px']:.1f} px")
+        if result.get('confidence'):
+            texts.append(f"Conf: {result['confidence']:.2f}")
+        if result.get('quality_score'):
+            texts.append(f"Quality: {result['quality_score']:.2f}")
+        texts.append(f"Algorithm: {result.get('algorithm', 'ratio')}")
+        texts.append(f"HVID: {HVID_MM}mm | Bias: {BIAS_CORRECTION_FACTOR}")
+        
+        # Draw text with background
+        y_offset = 30
+        for text in texts:
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(viz, (10, y_offset - 20), (15 + text_size[0], y_offset + 5), BG_COLOR, -1)
+            cv2.putText(viz, text, (12, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_COLOR, 2)
+            y_offset += 30
+        
+        # Add validity indicator
+        validity_text = "VALID" if result.get('is_valid') else "INVALID"
+        validity_color = (0, 255, 0) if result.get('is_valid') else (0, 0, 255)
+        cv2.putText(viz, validity_text, (w - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, validity_color, 2)
+        
+        return viz
+

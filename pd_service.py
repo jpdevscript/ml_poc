@@ -451,7 +451,6 @@ class PDService:
                     else:
                         print(f"[PDService] Frame {i} passed quality gates (blur={blur_score:.1f}, yaw={yaw:.1f}°, pitch={pitch:.1f}°)")
                 
-                # Process frame with debug enabled for this frame
                 try:
                     if use_iris_only:
                         # Use proper IrisPDEngine with complete 6-stage algorithm
@@ -462,6 +461,14 @@ class PDService:
                         
                         # Process frame
                         result = iris_engine.process_frame(image)
+                        
+                        # Save debug images for iris method
+                        cv2.imwrite(os.path.join(frame_debug_dir, "input.jpg"), image)
+                        
+                        # Create visualization with iris landmarks using engine's visualize method
+                        landmarks = result.get('face_landmarks')
+                        viz_image = iris_engine.visualize(image, result, landmarks)
+                        cv2.imwrite(os.path.join(frame_debug_dir, "result.jpg"), viz_image)
                         
                         if result['is_valid'] and result['pd_mm']:
                             pd_values.append(result['pd_mm'])
@@ -475,7 +482,7 @@ class PDService:
                                 'iris_px': result['iris_diameter_px'],
                                 'method': 'iris'
                             }
-                            print(f"[PDService] Frame {i}: PD={result['pd_mm']:.2f}mm, depth={result['depth_mm']:.0f}mm, iris={result['iris_diameter_px']:.1f}px")
+                            print(f"[PDService] Frame {i}: PD={result['pd_mm']:.2f}mm, iris={result['iris_diameter_px']:.1f}px, conf={result['confidence']:.2f}")
                         else:
                             frame_result = {
                                 'frame': i,
