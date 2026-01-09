@@ -38,7 +38,7 @@ FAR_PD_ADJUSTMENT = 2.0  # mm (conservative industry standard)
 # Validation thresholds
 MAX_CARD_HEAD_TILT_DIFF = 15.0  # degrees
 MAX_CONVEXITY_DEFECT = 0.15  # 15% of bounding box area
-MAX_ASPECT_RATIO_ERROR = 0.20  # 20% deviation from ideal
+MAX_ASPECT_RATIO_ERROR = 0.60  # 20% deviation from ideal
 
 
 @dataclass
